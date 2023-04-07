@@ -1,29 +1,7 @@
 {
   "author": {
-    "name": "Koen Kanters",
-    "email": "koenkanters94@gmail.com"
+    "name": "willieee802"
   },
-  "bugs": {
-    "url": "https://github.com/koenkk/zigbee-herdsman/issues"
-  },
-  "contributors": [
-    {
-      "name": "Koen Kanters",
-      "email": "koenkanters94@gmail.com"
-    },
-    {
-      "name": "Hedy Wang",
-      "email": "hedywings@gmail.com"
-    },
-    {
-      "name": "Simen Li",
-      "email": "simenkid@gmail.com"
-    },
-    {
-      "name": "Jack Wu",
-      "email": "jackchased@gmail.com"
-    }
-  ],
   "dependencies": {
     "@serialport/bindings-cpp": "^10.8.0",
     "@serialport/parser-delimiter": "^10.5.0",
@@ -36,7 +14,7 @@
     "slip": "^1.0.2"
   },
   "deprecated": false,
-  "description": "An open source ZigBee gateway solution with node.js.",
+  "description": "Custom fork from zigbee-herdsman",
   "devDependencies": {
     "@babel/cli": "*",
     "@babel/core": "*",
@@ -70,10 +48,10 @@
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "name": "zigbee-herdsman",
+  "name": "@willieee802/zigbee-herdsman",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Koenkk/zigbee-herdsman.git"
+    "url": "git://github.com/willieee802/zigbee-herdsman.git"
   },
   "scripts": {
     "build": "./node_modules/.bin/tsc",
