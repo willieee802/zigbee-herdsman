@@ -131,7 +131,7 @@ class Controller extends events.EventEmitter {
         debug.log(`Starting with options '${JSON.stringify(this.options)}'`);
         const startResult = await this.adapter.start();
         debug.log(`Started with result '${startResult}'`);
-        Entity.injectAdapter(this.adapter);
+        Entity.injectAdapter(this.database.id, this.adapter);
 
         // log injection
         debug.log(`Injected database: ${this.database != null}, adapter: ${this.adapter != null}`);
@@ -564,7 +564,7 @@ class Controller extends events.EventEmitter {
             this.selfAndDeviceEmit(device, Events.Events.deviceInterview, payloadStart);
 
             try {
-                await device.interview(this.adapter);
+                await device.interview();
                 debug.log(`Succesfully interviewed '${device.ieeeAddr}'`);
                 const event: Events.DeviceInterviewPayload = {status: 'successful', device};
                 this.selfAndDeviceEmit(device, Events.Events.deviceInterview, event);
@@ -734,7 +734,7 @@ class Controller extends events.EventEmitter {
 
 
         if (this.isZclDataPayload(dataPayload, dataType)) {
-            device.onZclData(dataPayload, endpoint, this.adapter);
+            device.onZclData(dataPayload, endpoint);
         }
     }
 }

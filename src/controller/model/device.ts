@@ -1,5 +1,5 @@
 import {KeyValue, DatabaseEntry, DeviceType, SendRequestWhen} from '../tstype';
-import {Adapter, Events as AdapterEvents} from '../../adapter';
+import {Events as AdapterEvents} from '../../adapter';
 import ZclTransactionSequenceNumber from '../helpers/zclTransactionSequenceNumber';
 import Endpoint from './endpoint';
 import Entity from './entity';
@@ -204,9 +204,7 @@ class Device extends Entity {
         return this.endpoints.find(e => e.hasPendingRequests()) !== undefined;
     }
 
-    public async onZclData(dataPayload: AdapterEvents.ZclDataPayload, endpoint: Endpoint, 
-        adapter: Adapter
-    ): Promise<void> {
+    public async onZclData(dataPayload: AdapterEvents.ZclDataPayload, endpoint: Endpoint): Promise<void> {
         const frame = dataPayload.frame;
 
         // Update reportable properties
@@ -220,7 +218,7 @@ class Device extends Entity {
         if (frame.isSpecific() && frame.isCluster('ssIasZone') && frame.isCommand('enrollReq')) {
             debug.log(`IAS - '${this.ieeeAddr}' responding to enroll response`);
             const payload = {enrollrspcode: 0, zoneid: 23};
-            await endpoint.command('ssIasZone', 'enrollRsp', payload, adapter, {disableDefaultResponse: true});
+            await endpoint.command('ssIasZone', 'enrollRsp', payload, {disableDefaultResponse: true});
         }
 
         // Reponse to read requests
@@ -251,7 +249,7 @@ class Device extends Entity {
 
                 try {
                     await endpoint.readResponse(frame.Cluster.ID, frame.Header.transactionSequenceNumber, response,
-                        adapter, {srcEndpoint: dataPayload.destinationEndpoint});
+                        {srcEndpoint: dataPayload.destinationEndpoint});
                 } catch (error) {
                     debug.error(`Read response to ${this.ieeeAddr} failed`);
                 }
@@ -268,19 +266,19 @@ class Device extends Entity {
                         fastPollTimeout: 0,
                     };
                     debug.log(`check-in from ${this.ieeeAddr}: accepting fast-poll`);
-                    await endpoint.command(frame.Cluster.ID, 'checkinRsp', payload, adapter, {sendWhen: 'immediate'});
+                    await endpoint.command(frame.Cluster.ID, 'checkinRsp', payload, {sendWhen: 'immediate'});
                     await Promise.all(this.endpoints.map(async e => e.sendPendingRequests(true)));
                     // We *must* end fast-poll when we're done sending things. Otherwise
                     // we cause undue power-drain.
                     debug.log(`check-in from ${this.ieeeAddr}: stopping fast-poll`);
-                    await endpoint.command(frame.Cluster.ID, 'fastPollStop', {}, adapter, {sendWhen: 'immediate'});
+                    await endpoint.command(frame.Cluster.ID, 'fastPollStop', {}, {sendWhen: 'immediate'});
                 } else {
                     const payload = {
                         startFastPolling: false,
                         fastPollTimeout: 0,
                     };
                     debug.log(`check-in from ${this.ieeeAddr}: declining fast-poll`);
-                    await endpoint.command(frame.Cluster.ID, 'checkinRsp', payload, adapter, {sendWhen: 'immediate'});
+                    await endpoint.command(frame.Cluster.ID, 'checkinRsp', payload, {sendWhen: 'immediate'});
                 }
             } catch (error) {
                 /* istanbul ignore next */
@@ -299,7 +297,7 @@ class Device extends Entity {
             try {
                 this._lastDefaultResponseSequenceNumber = frame.Header.transactionSequenceNumber;
                 await endpoint.defaultResponse(
-                    frame.getCommand().ID, 0, frame.Cluster.ID, frame.Header.transactionSequenceNumber, adapter
+                    frame.getCommand().ID, 0, frame.Cluster.ID, frame.Header.transactionSequenceNumber,
                 );
             } catch (error) {
                 debug.error(`Default response to ${this.ieeeAddr} failed`);
@@ -451,7 +449,7 @@ class Device extends Entity {
      * Zigbee functions
      */
 
-    public async interview(adapter: Adapter): Promise<void> {
+    public async interview(): Promise<void> {
         if (this.interviewing) {
             const message = `Interview - interview already in progress for '${this.ieeeAddr}'`;
             debug.log(message);
@@ -463,7 +461,7 @@ class Device extends Entity {
         debug.log(`Interview - start device '${this.ieeeAddr}'`);
 
         try {
-            await this.interviewInternal(adapter);
+            await this.interviewInternal();
             debug.log(`Interview - completed for device '${this.ieeeAddr}'`);
             this._interviewCompleted = true;
         } catch (e) {
@@ -541,9 +539,9 @@ class Device extends Entity {
         }
     }
 
-    private async interviewInternal(adapter: Adapter): Promise<void> {
+    private async interviewInternal(): Promise<void> {
         const nodeDescriptorQuery = async (): Promise<void> => {
-            const nodeDescriptor = await adapter.nodeDescriptor(this.networkAddress);
+            const nodeDescriptor = await Entity.getAdapterByID(this.databaseID).nodeDescriptor(this.networkAddress);
             this._manufacturerID = nodeDescriptor.manufacturerCode;
             this._type = nodeDescriptor.type;
             debug.log(`Interview - got node descriptor for device '${this.ieeeAddr}'`);
@@ -591,8 +589,9 @@ class Device extends Entity {
                 const endpoint = Endpoint.create(this.databaseID, 1, undefined, undefined, [], [],
                     this.networkAddress, this.ieeeAddr
                 );
-                const result = await endpoint.read('genBasic', ['modelId', 'manufacturerName'], adapter,
-                    {sendWhen: 'immediate'});
+                const result = await endpoint.read('genBasic', ['modelId', 'manufacturerName'],
+                    {sendWhen: 'immediate'}
+                );
                 Object.entries(result)
                     .forEach((entry) => Device.ReportablePropertiesMapping[entry[0]].set(entry[1], this));
             } catch (error) {
@@ -603,6 +602,7 @@ class Device extends Entity {
 
         // e.g. Xiaomi Aqara Opple devices fail to respond to the first active endpoints request, therefore try 2 times
         // https://github.com/Koenkk/zigbee-herdsman/pull/103
+        const adapter = Entity.getAdapterByID(this.databaseID);
         let activeEndpoints;
         for (let attempt = 0; attempt < 2; attempt++) {
             try {
@@ -645,7 +645,7 @@ class Device extends Entity {
                         try {
                             let result: KeyValue;
                             try {
-                                result = await endpoint.read('genBasic', [key], adapter, {sendWhen: 'immediate'});
+                                result = await endpoint.read('genBasic', [key], {sendWhen: 'immediate'});
                             } catch (error) {
                                 // Reading attributes can fail for many reason, e.g. it could be that device rejoins
                                 // while joining like in:
@@ -655,7 +655,7 @@ class Device extends Entity {
                                     debug.log(`Interview - first ${item.key} retrieval attempt failed, ` +
                                         `retrying after 10 seconds...`);
                                     await Wait(10000);
-                                    result = await endpoint.read('genBasic', [key], adapter, {sendWhen: 'immediate'});
+                                    result = await endpoint.read('genBasic', [key], {sendWhen: 'immediate'});
                                 } else {
                                     throw error;
                                 }
@@ -680,16 +680,14 @@ class Device extends Entity {
         for (const endpoint of this.endpoints.filter((e): boolean => e.supportsInputCluster('ssIasZone'))) {
             debug.log(`Interview - IAS - enrolling '${this.ieeeAddr}' endpoint '${endpoint.ID}'`);
 
-            const stateBefore = await endpoint.read('ssIasZone', ['iasCieAddr', 'zoneState'], 
-                adapter, {sendWhen: 'immediate'});
+            const stateBefore = await endpoint.read('ssIasZone', ['iasCieAddr', 'zoneState'], {sendWhen: 'immediate'});
             debug.log(`Interview - IAS - before enrolling state: '${JSON.stringify(stateBefore)}'`);
 
             // Do not enroll when device has already been enrolled
             if (stateBefore.zoneState !== 1 || stateBefore.iasCieAddr !== coordinator.ieeeAddr) {
                 debug.log(`Interview - IAS - not enrolled, enrolling`);
 
-                await endpoint.write('ssIasZone', {'iasCieAddr': coordinator.ieeeAddr}, 
-                    adapter, {sendWhen: 'immediate'});
+                await endpoint.write('ssIasZone', {'iasCieAddr': coordinator.ieeeAddr}, {sendWhen: 'immediate'});
                 debug.log(`Interview - IAS - wrote iasCieAddr`);
 
                 // There are 2 enrollment procedures:
@@ -701,13 +699,14 @@ class Device extends Entity {
                 await Wait(500);
                 debug.log(`IAS - '${this.ieeeAddr}' sending enroll response (auto enroll)`);
                 const payload = {enrollrspcode: 0, zoneid: 23};
-                await endpoint.command('ssIasZone', 'enrollRsp', payload, adapter,
-                    {disableDefaultResponse: true, sendWhen: 'immediate'});
+                await endpoint.command('ssIasZone', 'enrollRsp', payload, 
+                    {disableDefaultResponse: true, sendWhen: 'immediate'}
+                );
 
                 let enrolled = false;
                 for (let attempt = 0; attempt < 20; attempt++) {
                     await Wait(500);
-                    const stateAfter = await endpoint.read('ssIasZone', ['iasCieAddr', 'zoneState'], adapter,
+                    const stateAfter = await endpoint.read('ssIasZone', ['iasCieAddr', 'zoneState'],
                         {sendWhen: 'immediate'});
                     debug.log(`Interview - IAS - after enrolling state (${attempt}): '${JSON.stringify(stateAfter)}'`);
                     if (stateAfter.zoneState === 1) {
@@ -732,8 +731,8 @@ class Device extends Entity {
         try {
             for (const endpoint of this.endpoints.filter((e): boolean => e.supportsInputCluster('genPollCtrl'))) {
                 debug.log(`Interview - Poll control - binding '${this.ieeeAddr}' endpoint '${endpoint.ID}'`);
-                await endpoint.bind('genPollCtrl', coordinator.endpoints[0], adapter);
-                const pollPeriod = await endpoint.read('genPollCtrl', ['checkinInterval'], adapter);
+                await endpoint.bind('genPollCtrl', coordinator.endpoints[0]);
+                const pollPeriod = await endpoint.read('genPollCtrl', ['checkinInterval']);
                 if (pollPeriod.checkinInterval <= 2400) {// 10 minutes
                     this.defaultSendRequestWhen = 'fastpoll';
                 } else {
@@ -746,7 +745,7 @@ class Device extends Entity {
         }
     }
 
-    public async removeFromNetwork(adapter: Adapter): Promise<void> {
+    public async removeFromNetwork(): Promise<void> {
         if (this._type === 'GreenPower') {
             const payload = {
                 options: 0x002550,
@@ -758,8 +757,8 @@ class Device extends Entity {
                 null, ZclTransactionSequenceNumber.next(), 'pairing', 33, payload
             );
 
-            await adapter.sendZclFrameToAll(242, frame, 242);
-        } else await adapter.removeDevice(this.networkAddress, this.ieeeAddr);
+            await Entity.getAdapterByID(this.databaseID).sendZclFrameToAll(242, frame, 242);
+        } else await Entity.getAdapterByID(this.databaseID).removeDevice(this.networkAddress, this.ieeeAddr);
         await this.removeFromDatabase();
     }
 
@@ -789,19 +788,19 @@ class Device extends Entity {
         this._endpoints = newEndpoints;
     }
 
-    public async lqi(adapter: Adapter): Promise<LQI> {
-        return adapter.lqi(this.networkAddress);
+    public async lqi(): Promise<LQI> {
+        return Entity.getAdapterByID(this.databaseID).lqi(this.networkAddress);
     }
 
-    public async routingTable(adapter: Adapter): Promise<RoutingTable> {
-        return adapter.routingTable(this.networkAddress);
+    public async routingTable(): Promise<RoutingTable> {
+        return Entity.getAdapterByID(this.databaseID).routingTable(this.networkAddress);
     }
 
-    public async ping(adapter: Adapter, disableRecovery = true): Promise<void> {
+    public async ping( disableRecovery = true): Promise<void> {
         // Zigbee does not have an official pining mechamism. Use a read request
         // of a mandatory basic cluster attribute to keep it as lightweight as
         // possible.
-        await this.endpoints[0].read('genBasic', ['zclVersion'], adapter, {disableRecovery});
+        await this.endpoints[0].read('genBasic', ['zclVersion'], {disableRecovery});
     }
 }
 
