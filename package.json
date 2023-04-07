@@ -41,10 +41,6 @@
     "typescript": "*"
   },
   "homepage": "https://github.com/Koenkk/zigbee-herdsman",
-  "keywords": [
-    "zigbee",
-    "cc253x"
-  ],
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -62,7 +58,6 @@
     "eslint": "node_modules/.bin/eslint . --ext .ts --max-warnings=0",
     "docs": "typedoc --tsconfig typedoc-tsconfig.json"
   },
-  "version": "0.14.105",
   "jest": {
     "coverageThreshold": {
       "global": {
