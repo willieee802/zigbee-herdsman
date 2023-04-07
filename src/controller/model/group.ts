@@ -6,6 +6,7 @@ import Endpoint from './endpoint';
 import Device from './device';
 import assert from 'assert';
 import Debug from "debug";
+import {Adapter} from '../../adapter';
 
 const debug = {
     info: Debug('zigbee-herdsman:controller:group'),
@@ -22,6 +23,7 @@ interface Options {
 
 class Group extends Entity {
     private databaseID: number;
+    private ID: number;
     public readonly groupID: number;
     private readonly _members: Set<Endpoint>;
     get members(): Endpoint[] {return Array.from(this._members).filter((e) => e.getDevice());}
@@ -30,11 +32,12 @@ class Group extends Entity {
 
     // This lookup contains all groups that are queried from the database, this is to ensure that always
     // the same instance is returned.
-    private static groups: {[groupID: number]: Group} = null;
+    private static groups: Map<number, {[groupID: number]: Group}> = new Map<number, {[groupID: number]: Group}>();
 
-    private constructor(databaseID: number, groupID: number, members: Set<Endpoint>, meta: KeyValue) {
+    private constructor(databaseID: number, ID: number, groupID: number, members: Set<Endpoint>, meta: KeyValue) {
         super();
         this.databaseID = databaseID;
+        this.ID = ID;
         this.groupID = groupID;
         this._members = members;
         this.meta = meta;
@@ -44,17 +47,17 @@ class Group extends Entity {
      * CRUD
      */
 
-    private static fromDatabaseEntry(entry: DatabaseEntry): Group {
+    private static fromDatabaseEntry(entry: DatabaseEntry, databaseID: number): Group {
         const members = new Set<Endpoint>();
         for (const member of entry.members) {
-            const device = Device.byIeeeAddr(member.deviceIeeeAddr);
+            const device = Device.byIeeeAddr(databaseID, member.deviceIeeeAddr);
             if (device) {
                 const endpoint = device.getEndpoint(member.endpointID);
                 members.add(endpoint);
             }
         }
 
-        return new Group(entry.id, entry.groupID, members, entry.meta);
+        return new Group(databaseID, entry.id, entry.groupID, members, entry.meta);
     }
 
     private toDatabaseRecord(): DatabaseEntry {
@@ -62,48 +65,60 @@ class Group extends Entity {
             return {deviceIeeeAddr: member.getDevice().ieeeAddr, endpointID: member.ID};
         });
 
-        return {id: this.databaseID, type: 'Group', groupID: this.groupID, members, meta: this.meta};
+        return {id: this.ID, type: 'Group', groupID: this.groupID, members, meta: this.meta};
     }
 
     private static loadFromDatabaseIfNecessary(): void {
-        if (!Group.groups) {
-            Group.groups = {};
-            const entries = Entity.database.getEntries(['Group']);
-            for (const entry of entries) {
-                const group = Group.fromDatabaseEntry(entry);
-                Group.groups[group.groupID] = group;
+        Entity.databases.forEach(database => {
+            if (!Group.groups.get(database.id)) {
+                Group.groups.set(database.id, {});
+                const entries = database.getEntries(['Group']);
+                for (const entry of entries) {
+                    const group = Group.fromDatabaseEntry(entry, database.id);
+                    Group.groups.get(database.id)[group.groupID] = group;
+                }
             }
-        }
+        });
     }
 
-    public static byGroupID(groupID: number): Group {
+    public static byGroupID(groupID: number, databaseID: number): Group {
         Group.loadFromDatabaseIfNecessary();
-        return Group.groups[groupID];
+        return Group.groups.get(databaseID)[groupID];
     }
 
-    public static all(): Group[] {
+    // public static all(): Group[] {
+    //     Group.loadFromDatabaseIfNecessary();
+    //     const groups: Group[] = [];
+    //     Group.groups.forEach(groupDB => {
+    //         groups.push(...Object.values(groupDB));
+    //     });
+    //     return groups;
+    // }
+
+    public static allByDatabaseID(databaseID: number): Group[] {
         Group.loadFromDatabaseIfNecessary();
-        return Object.values(Group.groups);
+        return Object.values(Group.groups.get(databaseID));
     }
 
-    public static create(groupID: number): Group {
+    public static create(groupID: number, databaseID: number): Group {
         assert(typeof groupID === 'number', 'GroupID must be a number');
         Group.loadFromDatabaseIfNecessary();
-        if (Group.groups[groupID]) {
+        if (Group.groups.get(databaseID)[groupID]) {
             throw new Error(`Group with groupID '${groupID}' already exists`);
         }
 
-        const databaseID = Entity.database.newID();
-        const group = new Group(databaseID, groupID, new Set(), {});
-        Entity.database.insert(group.toDatabaseRecord());
+        const database = Entity.getDatabaseByID(databaseID);
+        const ID = database.newID();
+        const group = new Group(databaseID, ID, groupID, new Set(), {});
+        database.insert(group.toDatabaseRecord());
 
-        Group.groups[group.groupID] = group;
+        Group.groups.get(database.id)[group.groupID] = group;
         return group;
     }
 
-    public async removeFromNetwork(): Promise<void> {
+    public async removeFromNetwork(adapter: Adapter): Promise<void> {
         for (const endpoint of this._members) {
-            await endpoint.removeFromGroup(this);
+            await endpoint.removeFromGroup(this, adapter);
         }
 
         this.removeFromDatabase();
@@ -111,16 +126,17 @@ class Group extends Entity {
 
     public removeFromDatabase(): void {
         Group.loadFromDatabaseIfNecessary();
+        const database = Entity.getDatabaseByID(this.databaseID);
 
-        if (Entity.database.has(this.databaseID)) {
-            Entity.database.remove(this.databaseID);
+        if (database.has(this.databaseID)) {
+            database.remove(this.databaseID);
         }
 
-        delete Group.groups[this.groupID];
+        delete Group.groups.get(database.id)[this.groupID];
     }
 
     public save(writeDatabase=true): void {
-        Entity.database.update(this.toDatabaseRecord(), writeDatabase);
+        Entity.getDatabaseByID(this.databaseID).update(this.toDatabaseRecord(), writeDatabase);
     }
 
     public addMember(endpoint: Endpoint): void {
@@ -142,7 +158,7 @@ class Group extends Entity {
      */
 
     public async write(
-        clusterKey: number | string, attributes: KeyValue, options?: Options
+        clusterKey: number | string, attributes: KeyValue, adapter: Adapter, options?: Options
     ): Promise<void> {
         options = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
         const cluster = Zcl.Utils.getCluster(clusterKey);
@@ -167,7 +183,7 @@ class Group extends Entity {
                 options.manufacturerCode, options.transactionSequenceNumber ?? ZclTransactionSequenceNumber.next(),
                 'write', cluster.ID, payload, options.reservedBits
             );
-            await Entity.adapter.sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
+            await adapter.sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
         } catch (error) {
             error.message = `${log} failed (${error.message})`;
             debug.error(error.message);
@@ -176,7 +192,7 @@ class Group extends Entity {
     }
 
     public async read(
-        clusterKey: number | string, attributes: string[] | number [], options?: Options
+        clusterKey: number | string, attributes: string[] | number [], adapter: Adapter, options?: Options
     ): Promise<void> {
         options = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
         const cluster = Zcl.Utils.getCluster(clusterKey);
@@ -195,7 +211,7 @@ class Group extends Entity {
         debug.info(log);
 
         try {
-            await Entity.adapter.sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
+            await adapter.sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
         } catch (error) {
             error.message = `${log} failed (${error.message})`;
             debug.error(error.message);
@@ -204,7 +220,7 @@ class Group extends Entity {
     }
 
     public async command(
-        clusterKey: number | string, commandKey: number | string, payload: KeyValue, options?: Options
+        clusterKey: number | string, commandKey: number | string, payload: KeyValue, adapter: Adapter, options?: Options
     ): Promise<void> {
         options = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
         const cluster = Zcl.Utils.getCluster(clusterKey);
@@ -219,7 +235,7 @@ class Group extends Entity {
                 options.transactionSequenceNumber || ZclTransactionSequenceNumber.next(),
                 command.ID, cluster.ID, payload, options.reservedBits
             );
-            await Entity.adapter.sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
+            await adapter.sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
         } catch (error) {
             error.message = `${log} failed (${error.message})`;
             debug.error(error.message);

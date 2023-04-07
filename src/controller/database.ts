@@ -1,18 +1,33 @@
 import fs from 'fs';
 import Debug from "debug";
 import {DatabaseEntry, EntityType} from './tstype';
+import {Entity} from './model';
 
 const debug = {
     log: Debug('zigbee-herdsman:controller:database:log'),
 };
 
 class Database {
+    private _id: number;
     private entries: {[id: number]: DatabaseEntry};
     private path: string;
 
+    public get id(): number {
+        return this._id;
+    }
+
     private constructor(entries: {[id: number]: DatabaseEntry}, path: string) {
+        this._id = this.generateDatabaseID();
         this.entries = entries;
         this.path = path;
+    }
+
+    private generateDatabaseID(): number {
+        for (let i = 1; i < 100000; i++) {
+            if (!Entity.databaseIDExists(i)) {
+                return i;
+            }
+        }
     }
 
     public static open(path: string): Database {

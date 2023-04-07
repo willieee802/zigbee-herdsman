@@ -154,11 +154,11 @@ class Controller extends events.EventEmitter {
             }
 
             debug.log('Clearing database...');
-            for (const group of Group.all()) {
+            for (const group of Group.allByDatabaseID(this.database.id)) {
                 group.removeFromDatabase();
             }
 
-            for (const device of Device.all()) {
+            for (const device of Device.allByDatabaseID(this.database.id)) {
                 device.removeFromDatabase();
             }
         }
@@ -169,16 +169,16 @@ class Controller extends events.EventEmitter {
 
         // Add coordinator to the database if it is not there yet.
         const coordinator = await this.adapter.getCoordinator();
-        if (Device.byType('Coordinator').length === 0) {
+        if (Device.byType('Coordinator', this.database.id).length === 0) {
             debug.log('No coordinator in database, querying...');
             Device.create(
                 'Coordinator', coordinator.ieeeAddr, coordinator.networkAddress, coordinator.manufacturerID,
-                undefined, undefined, undefined, true, coordinator.endpoints
+                undefined, undefined, undefined, true, coordinator.endpoints, this.database.id,
             );
         }
 
         // Update coordinator ieeeAddr if changed, can happen due to e.g. reflashing
-        const databaseCoordinator = Device.byType('Coordinator')[0];
+        const databaseCoordinator = Device.byType('Coordinator', this.database.id)[0];
         if (databaseCoordinator.ieeeAddr !== coordinator.ieeeAddr) {
             debug.log(`Coordinator address changed, updating to '${coordinator.ieeeAddr}'`);
             databaseCoordinator.changeIeeeAddress(coordinator.ieeeAddr);
@@ -310,11 +310,11 @@ class Controller extends events.EventEmitter {
     }
 
     private databaseSave(): void {
-        for (const device of Device.all()) {
+        for (const device of Device.allByDatabaseID(this.database.id)) {
             device.save(false);
         }
 
-        for (const group of Group.all()) {
+        for (const group of Group.allByDatabaseID(this.database.id)) {
             group.save(false);
         }
 
@@ -355,49 +355,49 @@ class Controller extends events.EventEmitter {
      * Get all devices
      */
     public getDevices(): Device[] {
-        return Device.all();
+        return Device.allByDatabaseID(this.database.id);
     }
 
     /**
      * Get all devices with a specific type
      */
     public getDevicesByType(type: DeviceType): Device[] {
-        return Device.byType(type);
+        return Device.byType(type, this.database.id);
     }
 
     /**
      * Get device by ieeeAddr
      */
     public getDeviceByIeeeAddr(ieeeAddr: string): Device {
-        return Device.byIeeeAddr(ieeeAddr);
+        return Device.byIeeeAddr(this.database.id, ieeeAddr);
     }
 
     /**
      * Get device by networkAddress
      */
     public getDeviceByNetworkAddress(networkAddress: number): Device {
-        return Device.byNetworkAddress(networkAddress);
+        return Device.byNetworkAddress(networkAddress, this.database.id);
     }
 
     /**
      * Get group by ID
      */
     public getGroupByID(groupID: number): Group {
-        return Group.byGroupID(groupID);
+        return Group.byGroupID(groupID, this.database.id);
     }
 
     /**
      * Get all groups
      */
     public getGroups(): Group[] {
-        return Group.all();
+        return Group.allByDatabaseID(this.database.id);
     }
 
     /**
      * Create a Group
      */
     public createGroup(groupID: number): Group {
-        return Group.create(groupID);
+        return Group.create(groupID, this.database.id);
     }
 
     /**
@@ -409,7 +409,7 @@ class Controller extends events.EventEmitter {
 
     private onNetworkAddress(payload: AdapterEvents.NetworkAddressPayload): void {
         debug.log(`Network address '${payload.ieeeAddr}'`);
-        const device = Device.byIeeeAddr(payload.ieeeAddr);
+        const device = Device.byIeeeAddr(this.database.id, payload.ieeeAddr);
 
         if (!device) {
             debug.log(`Network address is from unknown device '${payload.ieeeAddr}'`);
@@ -431,7 +431,7 @@ class Controller extends events.EventEmitter {
 
     private onDeviceAnnounce(payload: AdapterEvents.DeviceAnnouncePayload): void {
         debug.log(`Device announce '${payload.ieeeAddr}'`);
-        const device = Device.byIeeeAddr(payload.ieeeAddr);
+        const device = Device.byIeeeAddr(this.database.id, payload.ieeeAddr);
 
         if (!device) {
             debug.log(`Device announce is from unknown device '${payload.ieeeAddr}'`);
@@ -456,7 +456,7 @@ class Controller extends events.EventEmitter {
     private onDeviceLeave(payload: AdapterEvents.DeviceLeavePayload): void {
         debug.log(`Device leave '${payload.ieeeAddr}'`);
 
-        const device = Device.byIeeeAddr(payload.ieeeAddr);
+        const device = Device.byIeeeAddr(this.database.id, payload.ieeeAddr);
         if (device) {
             debug.log(`Removing device from database '${payload.ieeeAddr}'`);
             device.removeFromDatabase();
@@ -484,13 +484,13 @@ class Controller extends events.EventEmitter {
         // Green power devices dont' have a modelID, create a modelID based on the deviceID (=type)
         const modelID = `GreenPower_${payload.deviceID}`;
 
-        let device = Device.byIeeeAddr(ieeeAddr, true);
+        let device = Device.byIeeeAddr(this.database.id, ieeeAddr, true);
         if (!device) {
             debug.log(`New green power device '${ieeeAddr}' joined`);
             debug.log(`Creating device '${ieeeAddr}'`);
             device = Device.create(
                 'GreenPower', ieeeAddr, payload.networkAddress, null,
-                undefined, undefined, modelID, true, [],
+                undefined, undefined, modelID, true, [], this.database.id,
             );
             device.save();
 
@@ -529,13 +529,13 @@ class Controller extends events.EventEmitter {
             }
         }
 
-        let device = Device.byIeeeAddr(payload.ieeeAddr, true);
+        let device = Device.byIeeeAddr(this.database.id, payload.ieeeAddr, true);
         if (!device) {
             debug.log(`New device '${payload.ieeeAddr}' joined`);
             debug.log(`Creating device '${payload.ieeeAddr}'`);
             device = Device.create(
                 'Unknown', payload.ieeeAddr, payload.networkAddress, undefined,
-                undefined, undefined, undefined, false, []
+                undefined, undefined, undefined, false, [], this.database.id,
             );
             this.selfAndDeviceEmit(device, Events.Events.deviceJoined, {device} as Events.DeviceJoinedPayload);
         } else if (device.isDeleted) {
@@ -564,7 +564,7 @@ class Controller extends events.EventEmitter {
             this.selfAndDeviceEmit(device, Events.Events.deviceInterview, payloadStart);
 
             try {
-                await device.interview();
+                await device.interview(this.adapter);
                 debug.log(`Succesfully interviewed '${device.ieeeAddr}'`);
                 const event: Events.DeviceInterviewPayload = {status: 'successful', device};
                 this.selfAndDeviceEmit(device, Events.Events.deviceInterview, event);
@@ -605,12 +605,13 @@ class Controller extends events.EventEmitter {
             } else if (dataPayload.frame.Cluster.name === 'greenPower') {
                 await this.greenPower.onZclGreenPowerData(dataPayload);
                 // lookup encapsulated gpDevice for further processing
-                gpDevice = Device.byNetworkAddress(dataPayload.frame.Payload.srcID & 0xFFFF);
+                gpDevice = Device.byNetworkAddress(dataPayload.frame.Payload.srcID & 0xFFFF, this.database.id);
             }
         }
 
-        let device = gpDevice ? gpDevice : (typeof dataPayload.address === 'string' ?
-            Device.byIeeeAddr(dataPayload.address) : Device.byNetworkAddress(dataPayload.address));
+        let device = gpDevice ? gpDevice : (typeof dataPayload.address === 'string'
+            ? Device.byIeeeAddr(this.database.id, dataPayload.address)
+            : Device.byNetworkAddress(dataPayload.address, this.database.id));
         
         /**
          * Handling of re-transmitted Xiaomi messages.
@@ -626,7 +627,7 @@ class Controller extends events.EventEmitter {
          */
         if (device?.manufacturerName === 'LUMI' && device?.type == 'Router' && dataPayload.groupID) {
             debug.log(`Handling re-transmitted Xiaomi message ${device.networkAddress} -> ${dataPayload.groupID}`);
-            device = Device.byNetworkAddress(dataPayload.groupID);
+            device = Device.byNetworkAddress(dataPayload.groupID, this.database.id);
         }
 
         if (!device) {
@@ -733,7 +734,7 @@ class Controller extends events.EventEmitter {
 
 
         if (this.isZclDataPayload(dataPayload, dataType)) {
-            device.onZclData(dataPayload, endpoint);
+            device.onZclData(dataPayload, endpoint, this.adapter);
         }
     }
 }

@@ -7,6 +7,7 @@ import Group from './group';
 import Device from './device';
 import Debug from "debug";
 import assert from 'assert';
+import {Adapter} from '../../adapter';
 
 const debug = {
     info: Debug('zigbee-herdsman:controller:endpoint'),
@@ -76,6 +77,7 @@ interface PendingRequest {
 }
 
 class Endpoint extends Entity {
+    private databaseID: number;
     public deviceID?: number;
     public inputClusters: number[];
     public outputClusters: number[];
@@ -94,12 +96,12 @@ class Endpoint extends Entity {
         return this._binds.map((entry) => {
             let target: Group | Endpoint = null;
             if (entry.type === 'endpoint') {
-                const device = Device.byIeeeAddr(entry.deviceIeeeAddress);
+                const device = Device.byIeeeAddr(this.databaseID, entry.deviceIeeeAddress);
                 if (device) {
                     target = device.getEndpoint(entry.endpointID);
                 }
             } else {
-                target = Group.byGroupID(entry.groupID);
+                target = Group.byGroupID(entry.groupID, this.databaseID);
             }
 
             if (target) {
@@ -136,12 +138,13 @@ class Endpoint extends Entity {
     }
 
     private constructor(
-        ID: number, profileID: number, deviceID: number, inputClusters: number[], outputClusters: number[],
-        deviceNetworkAddress: number, deviceIeeeAddress: string, clusters: Clusters, binds: BindInternal[],
-        configuredReportings: ConfiguredReportingInternal[],
+        databaseID: number, ID: number, profileID: number, deviceID: number, inputClusters: number[],
+        outputClusters: number[], deviceNetworkAddress: number, deviceIeeeAddress: string, clusters: Clusters,
+        binds: BindInternal[], configuredReportings: ConfiguredReportingInternal[],
         meta: KeyValue,
     ) {
         super();
+        this.databaseID = databaseID;
         this.ID = ID;
         this.profileID = profileID;
         this.deviceID = deviceID;
@@ -160,7 +163,7 @@ class Endpoint extends Entity {
      * Get device of this endpoint
      */
     public getDevice(): Device {
-        return Device.byIeeeAddr(this.deviceIeeeAddress);
+        return Device.byIeeeAddr(this.databaseID, this.deviceIeeeAddress);
     }
 
     /**
@@ -204,7 +207,7 @@ class Endpoint extends Entity {
      */
 
     public static fromDatabaseRecord(
-        record: KeyValue, deviceNetworkAddress: number, deviceIeeeAddress: string,
+        record: KeyValue, deviceNetworkAddress: number, deviceIeeeAddress: string, databaseID: number,
     ): Endpoint {
         // Migrate attrs to attributes
         for (const entry of Object.values(record.clusters).filter((e) => e.hasOwnProperty('attrs'))) {
@@ -217,9 +220,9 @@ class Endpoint extends Entity {
         }
 
         return new Endpoint(
-            record.epId, record.profId, record.devId, record.inClusterList, record.outClusterList, deviceNetworkAddress,
-            deviceIeeeAddress, record.clusters, record.binds || [], record.configuredReportings || [],
-            record.meta || {},
+            databaseID, record.epId, record.profId, record.devId, record.inClusterList, record.outClusterList,
+            deviceNetworkAddress, deviceIeeeAddress, record.clusters, record.binds || [],
+            record.configuredReportings || [], record.meta || {},
         );
     }
 
@@ -232,11 +235,11 @@ class Endpoint extends Entity {
     }
 
     public static create(
-        ID: number, profileID: number, deviceID: number, inputClusters: number[], outputClusters: number[],
-        deviceNetworkAddress: number, deviceIeeeAddress: string,
+        databaseID: number, ID: number, profileID: number, deviceID: number, inputClusters: number[],
+        outputClusters: number[], deviceNetworkAddress: number, deviceIeeeAddress: string,
     ): Endpoint {
         return new Endpoint(
-            ID, profileID, deviceID, inputClusters, outputClusters, deviceNetworkAddress,
+            databaseID, ID, profileID, deviceID, inputClusters, outputClusters, deviceNetworkAddress,
             deviceIeeeAddress, {}, [], [], {},
         );
     }
@@ -318,7 +321,7 @@ class Endpoint extends Entity {
     }
 
     public async report(
-        clusterKey: number | string, attributes: KeyValue, options?: Options
+        clusterKey: number | string, attributes: KeyValue, adapter: Adapter, options?: Options
     ): Promise<void> {
         const cluster = Zcl.Utils.getCluster(clusterKey);
         options = this.getOptionsWithDefaults(options, true, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
@@ -346,7 +349,7 @@ class Endpoint extends Entity {
             );
 
             await this.sendRequest(async () => {
-                await Entity.adapter.sendZclFrameToEndpoint(
+                await adapter.sendZclFrameToEndpoint(
                     this.deviceIeeeAddress, this.deviceNetworkAddress, this.ID, frame, options.timeout,
                     options.disableResponse, options.disableRecovery, options.srcEndpoint,
                 );
@@ -359,7 +362,7 @@ class Endpoint extends Entity {
     }
 
     public async write(
-        clusterKey: number | string, attributes: KeyValue, options?: Options
+        clusterKey: number | string, attributes: KeyValue, adapter: Adapter, options?: Options
     ): Promise<void> {
         const cluster = Zcl.Utils.getCluster(clusterKey);
         options = this.getOptionsWithDefaults(options, true, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
@@ -387,7 +390,7 @@ class Endpoint extends Entity {
             );
 
             const result = await this.sendRequest(async () => {
-                return Entity.adapter.sendZclFrameToEndpoint(
+                return adapter.sendZclFrameToEndpoint(
                     this.deviceIeeeAddress, this.deviceNetworkAddress, this.ID, frame, options.timeout,
                     options.disableResponse, options.disableRecovery, options.srcEndpoint,
                 );
@@ -404,7 +407,8 @@ class Endpoint extends Entity {
     }
 
     public async writeResponse(
-        clusterKey: number | string, transactionSequenceNumber: number, attributes: KeyValue, options?: Options
+        clusterKey: number | string, transactionSequenceNumber: number, attributes: KeyValue, 
+        adapter: Adapter, options?: Options
     ): Promise<void> {
         assert(!options || !options.hasOwnProperty('transactionSequenceNumber'), 'Use parameter');
         const cluster = Zcl.Utils.getCluster(clusterKey);
@@ -436,7 +440,7 @@ class Endpoint extends Entity {
 
         try {
             await this.sendRequest(async () => {
-                await Entity.adapter.sendZclFrameToEndpoint(
+                await adapter.sendZclFrameToEndpoint(
                     this.deviceIeeeAddress, this.deviceNetworkAddress, this.ID, frame, options.timeout,
                     options.disableResponse, options.disableRecovery, options.srcEndpoint
                 );
@@ -449,7 +453,7 @@ class Endpoint extends Entity {
     }
     
     public async read(
-        clusterKey: number | string, attributes: string[] | number [], options?: Options
+        clusterKey: number | string, attributes: string[] | number [], adapter: Adapter, options?: Options
     ): Promise<KeyValue> {
         const cluster = Zcl.Utils.getCluster(clusterKey);
         options = this.getOptionsWithDefaults(options, true, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
@@ -470,7 +474,7 @@ class Endpoint extends Entity {
 
         try {
             const result = await this.sendRequest(async () => {
-                return Entity.adapter.sendZclFrameToEndpoint(
+                return adapter.sendZclFrameToEndpoint(
                     this.deviceIeeeAddress, this.deviceNetworkAddress, this.ID, frame, options.timeout,
                     options.disableResponse, options.disableRecovery, options.srcEndpoint,
                 );
@@ -490,7 +494,8 @@ class Endpoint extends Entity {
     }
 
     public async readResponse(
-        clusterKey: number | string, transactionSequenceNumber: number, attributes: KeyValue, options?: Options
+        clusterKey: number | string, transactionSequenceNumber: number, attributes: KeyValue, 
+        adapter: Adapter, options?: Options
     ): Promise<void> {
         assert(!options || !options.hasOwnProperty('transactionSequenceNumber'), 'Use parameter');
         const cluster = Zcl.Utils.getCluster(clusterKey);
@@ -518,7 +523,7 @@ class Endpoint extends Entity {
 
         try {
             await this.sendRequest(async () => {
-                await Entity.adapter.sendZclFrameToEndpoint(
+                await adapter.sendZclFrameToEndpoint(
                     this.deviceIeeeAddress, this.deviceNetworkAddress, this.ID, frame, options.timeout,
                     options.disableResponse, options.disableRecovery, options.srcEndpoint
                 );
@@ -533,7 +538,7 @@ class Endpoint extends Entity {
     public addBinding(clusterKey: number | string, target: Endpoint | Group | number): void {
         const cluster = Zcl.Utils.getCluster(clusterKey);
         if (typeof target === 'number') {
-            target = Group.byGroupID(target) || Group.create(target);
+            target = Group.byGroupID(target, this.databaseID) || Group.create(target, this.databaseID);
         }
 
         if (!this.binds.find((b) => b.cluster.ID === cluster.ID && b.target === target)) {
@@ -550,11 +555,11 @@ class Endpoint extends Entity {
         }
     }
 
-    public async bind(clusterKey: number | string, target: Endpoint | Group | number): Promise<void> {
+    public async bind(clusterKey: number | string, target: Endpoint | Group | number, adapter: Adapter): Promise<void> {
         const cluster = Zcl.Utils.getCluster(clusterKey);
         const type = target instanceof Endpoint ? 'endpoint' : 'group';
         if (typeof target === 'number') {
-            target = Group.byGroupID(target) || Group.create(target);
+            target = Group.byGroupID(target, this.databaseID) || Group.create(target, this.databaseID);
         }
 
         const destinationAddress = target instanceof Endpoint ? target.deviceIeeeAddress : target.groupID;
@@ -564,7 +569,7 @@ class Endpoint extends Entity {
         debug.info(log);
 
         try {
-            await Entity.adapter.bind(
+            await adapter.bind(
                 this.deviceNetworkAddress, this.deviceIeeeAddress, this.ID, cluster.ID, destinationAddress, type,
                 target instanceof Endpoint ? target.ID : null,
             );
@@ -581,7 +586,8 @@ class Endpoint extends Entity {
         this.getDevice().save();
     }
 
-    public async unbind(clusterKey: number | string, target: Endpoint | Group | number): Promise<void> {
+    public async unbind(clusterKey: number | string, target: Endpoint | Group | number, 
+        adapter: Adapter): Promise<void> {
         const cluster = Zcl.Utils.getCluster(clusterKey);
         const type = target instanceof Endpoint ? 'endpoint' : 'group';
 
@@ -593,13 +599,13 @@ class Endpoint extends Entity {
         debug.info(log);
 
         try {
-            await Entity.adapter.unbind(
+            await adapter.unbind(
                 this.deviceNetworkAddress, this.deviceIeeeAddress, this.ID, cluster.ID, destinationAddress, type,
                 target instanceof Endpoint ? target.ID : null,
             );
 
-            if (typeof target === 'number' && Group.byGroupID(target)) {
-                target = Group.byGroupID(target);
+            if (typeof target === 'number' && Group.byGroupID(target, this.databaseID)) {
+                target = Group.byGroupID(target, this.databaseID);
             }
 
             const index = this.binds.findIndex((b) => b.cluster.ID === cluster.ID && b.target === target);
@@ -615,7 +621,8 @@ class Endpoint extends Entity {
     }
 
     public async defaultResponse(
-        commandID: number, status: number, clusterID: number, transactionSequenceNumber: number, options?: Options
+        commandID: number, status: number, clusterID: number, transactionSequenceNumber: number, 
+        adapter: Adapter, options?: Options
     ): Promise<void> {
         assert(!options || !options.hasOwnProperty('transactionSequenceNumber'), 'Use parameter');
         options = this.getOptionsWithDefaults(options, true, Zcl.Direction.SERVER_TO_CLIENT, null);
@@ -631,7 +638,7 @@ class Endpoint extends Entity {
 
         try {
             await this.sendRequest(async () => {
-                await Entity.adapter.sendZclFrameToEndpoint(
+                await adapter.sendZclFrameToEndpoint(
                     this.deviceIeeeAddress, this.deviceNetworkAddress, this.ID, frame, options.timeout,
                     options.disableResponse, options.disableRecovery, options.srcEndpoint
                 );
@@ -644,7 +651,8 @@ class Endpoint extends Entity {
     }
 
     public async configureReporting(
-        clusterKey: number | string, items: ConfigureReportingItem[], options?: Options
+        clusterKey: number | string, items: ConfigureReportingItem[], adapter: Adapter, 
+        options?: Options
     ): Promise<void> {
         const cluster = Zcl.Utils.getCluster(clusterKey);
         options = this.getOptionsWithDefaults(options, true, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
@@ -684,7 +692,7 @@ class Endpoint extends Entity {
 
         try {
             const result = await this.sendRequest(async () => {
-                return Entity.adapter.sendZclFrameToEndpoint(
+                return adapter.sendZclFrameToEndpoint(
                     this.deviceIeeeAddress, this.deviceNetworkAddress, this.ID, frame, options.timeout,
                     options.disableResponse, options.disableRecovery, options.srcEndpoint
                 );
@@ -718,7 +726,8 @@ class Endpoint extends Entity {
         }
     }
 
-    public async writeStructured(clusterKey: number | string, payload: KeyValue, options?: Options): Promise<void> {
+    public async writeStructured(clusterKey: number | string, payload: KeyValue, 
+        adapter: Adapter, options?: Options): Promise<void> {
         const cluster = Zcl.Utils.getCluster(clusterKey);
         options = this.getOptionsWithDefaults(
             options, true, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
@@ -735,7 +744,7 @@ class Endpoint extends Entity {
 
         try {
             await this.sendRequest(async () => {
-                await Entity.adapter.sendZclFrameToEndpoint(
+                await adapter.sendZclFrameToEndpoint(
                     this.deviceIeeeAddress, this.deviceNetworkAddress, this.ID, frame, options.timeout,
                     options.disableResponse, options.disableRecovery, options.srcEndpoint
                 );
@@ -750,7 +759,8 @@ class Endpoint extends Entity {
     }
 
     public async command(
-        clusterKey: number | string, commandKey: number | string, payload: KeyValue, options?: Options,
+        clusterKey: number | string, commandKey: number | string, payload: KeyValue, 
+        adapter: Adapter, options?: Options,
     ): Promise<void | KeyValue> {
         const cluster = Zcl.Utils.getCluster(clusterKey);
         const command = cluster.getCommand(commandKey);
@@ -770,7 +780,7 @@ class Endpoint extends Entity {
 
         try {
             const result = await this.sendRequest(async () => {
-                return Entity.adapter.sendZclFrameToEndpoint(
+                return adapter.sendZclFrameToEndpoint(
                     this.deviceIeeeAddress, this.deviceNetworkAddress, this.ID, frame, options.timeout,
                     options.disableResponse, options.disableRecovery, options.srcEndpoint
                 );
@@ -787,7 +797,8 @@ class Endpoint extends Entity {
     }
 
     public async commandResponse(
-        clusterKey: number | string, commandKey: number | string, payload: KeyValue, options?: Options,
+        clusterKey: number | string, commandKey: number | string, payload: KeyValue, 
+        adapter: Adapter, options?: Options,
         transactionSequenceNumber?: number
     ): Promise<void | KeyValue> {
         assert(!options || !options.hasOwnProperty('transactionSequenceNumber'), 'Use parameter');
@@ -809,9 +820,9 @@ class Endpoint extends Entity {
             await this.sendRequest(async () => {
                 // Broadcast Green Power responses
                 if (this.ID === 242) {
-                    await Entity.adapter.sendZclFrameToAll(242, frame, 242);
+                    await adapter.sendZclFrameToAll(242, frame, 242);
                 } else {
-                    await Entity.adapter.sendZclFrameToEndpoint(
+                    await adapter.sendZclFrameToEndpoint(
                         this.deviceIeeeAddress, this.deviceNetworkAddress, this.ID, frame, options.timeout,
                         options.disableResponse, options.disableRecovery, options.srcEndpoint
                     );
@@ -825,11 +836,12 @@ class Endpoint extends Entity {
     }
 
     public waitForCommand(
-        clusterKey: number | string, commandKey: number | string, transactionSequenceNumber: number, timeout: number,
+        clusterKey: number | string, commandKey: number | string, transactionSequenceNumber: number, timeout: number, 
+        adapter: Adapter,
     ): {promise: Promise<{header: KeyValue; payload: KeyValue}>; cancel: () => void} {
         const cluster = Zcl.Utils.getCluster(clusterKey);
         const command = cluster.getCommand(commandKey);
-        const waiter = Entity.adapter.waitFor(
+        const waiter = adapter.waitFor(
             this.deviceNetworkAddress, this.ID, Zcl.FrameType.SPECIFIC, Zcl.Direction.CLIENT_TO_SERVER,
             transactionSequenceNumber, cluster.ID, command.ID, timeout
         );
@@ -864,8 +876,8 @@ class Endpoint extends Entity {
         };
     }
 
-    public async addToGroup(group: Group): Promise<void> {
-        await this.command('genGroups', 'add', {groupid: group.groupID, groupname: ''});
+    public async addToGroup(group: Group, adapter: Adapter): Promise<void> {
+        await this.command('genGroups', 'add', {groupid: group.groupID, groupname: ''}, adapter);
         group.addMember(this);
     }
 
@@ -874,20 +886,20 @@ class Endpoint extends Entity {
      * The number parameter type should only be used when removing from a group which is not known
      * to zigbee-herdsman.
      */
-    public async removeFromGroup(group: Group | number): Promise<void> {
-        await this.command('genGroups', 'remove', {groupid: group instanceof Group ? group.groupID : group});
+    public async removeFromGroup(group: Group | number, adapter: Adapter): Promise<void> {
+        await this.command('genGroups', 'remove', {groupid: group instanceof Group ? group.groupID : group}, adapter);
         if (group instanceof Group) {
             group.removeMember(this);
         }
     }
 
-    public async removeFromAllGroups(): Promise<void> {
-        await this.command('genGroups', 'removeAll', {}, {disableDefaultResponse: true});
+    public async removeFromAllGroups(adapter: Adapter): Promise<void> {
+        await this.command('genGroups', 'removeAll', {}, adapter, {disableDefaultResponse: true});
         this.removeFromAllGroupsDatabase();
     }
 
     public removeFromAllGroupsDatabase(): void {
-        for (const group of Group.all()) {
+        for (const group of Group.allByDatabaseID(this.databaseID)) {
             if (group.hasMember(this)) {
                 group.removeMember(this);
             }
