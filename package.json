@@ -34,7 +34,7 @@
     "eslint": "*",
     "jest": "*",
     "regenerator-runtime": "*",
-    "typedoc": "^0.23.28",
+    "typedoc": "^0.24.2",
     "typedoc-plugin-markdown": "*",
     "typedoc-plugin-no-inherit": "*",
     "typedoc-plugin-sourcefile-url": "*",
@@ -58,7 +58,7 @@
     "eslint": "node_modules/.bin/eslint . --ext .ts --max-warnings=0",
     "docs": "typedoc --tsconfig typedoc-tsconfig.json"
   },
-  "version": "0.14.105.2",
+  "version": "0.14.108",
   "jest": {
     "coverageThreshold": {
       "global": {

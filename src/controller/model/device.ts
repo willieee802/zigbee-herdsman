@@ -56,6 +56,8 @@ class Device extends Entity {
     private _deleted: boolean;
     private _defaultSendRequestWhen?: SendRequestWhen;
     private _lastDefaultResponseSequenceNumber: number;
+    private _checkinInterval: number;
+    private _pendingRequestTimeout: number;
 
     // Getters/setters
     get ieeeAddr(): string {return this._ieeeAddr;}
@@ -105,6 +107,9 @@ class Device extends Entity {
     set defaultSendRequestWhen(defaultSendRequestWhen: SendRequestWhen) {
         this._defaultSendRequestWhen = defaultSendRequestWhen;
     }
+    get checkinInterval(): number {return this._checkinInterval;}
+    get pendingRequestTimeout(): number {return this._pendingRequestTimeout;}
+    set pendingRequestTimeout(pendingRequestTimeout: number) {this._pendingRequestTimeout = pendingRequestTimeout;}
 
     public meta: KeyValue;
 
@@ -133,7 +138,8 @@ class Device extends Entity {
         manufacturerID: number, endpoints: Endpoint[], manufacturerName: string,
         powerSource: string, modelID: string, applicationVersion: number, stackVersion: number, zclVersion: number,
         hardwareVersion: number, dateCode: string, softwareBuildID: string, interviewCompleted: boolean, meta: KeyValue,
-        lastSeen: number, defaultSendRequestWhen: SendRequestWhen,
+        lastSeen: number, defaultSendRequestWhen: SendRequestWhen, checkinInterval: number,
+        pendingRequestTimeout: number
     ) {
         super();
         this.databaseID = databaseID;
@@ -159,6 +165,8 @@ class Device extends Entity {
         this.meta = meta;
         this._lastSeen = lastSeen;
         this._defaultSendRequestWhen = defaultSendRequestWhen;
+        this._checkinInterval = checkinInterval;
+        this._pendingRequestTimeout = pendingRequestTimeout;
     }
 
     public createEndpoint(ID: number): Endpoint {
@@ -260,13 +268,23 @@ class Device extends Entity {
         // Handle check-in from sleeping end devices
         if (frame.isSpecific() && frame.isCluster("genPollCtrl") && frame.isCommand("checkin")) {
             try {
-                if (this.hasPendingRequests()) {
+                if (this.hasPendingRequests() || (this._checkinInterval === undefined)) {
                     const payload = {
                         startFastPolling: true,
                         fastPollTimeout: 0,
                     };
                     debug.log(`check-in from ${this.ieeeAddr}: accepting fast-poll`);
                     await endpoint.command(frame.Cluster.ID, 'checkinRsp', payload, {sendWhen: 'immediate'});
+
+                    // This is a good time to read the checkin interval if we haven't stored it previously
+                    if (this._checkinInterval === undefined) {
+                        const pollPeriod =
+                            await endpoint.read('genPollCtrl', ['checkinInterval'], {sendWhen: 'immediate'});
+                        this._checkinInterval = pollPeriod.checkinInterval / 4; // convert to seconds
+                        this.pendingRequestTimeout = this._checkinInterval * 1000; // milliseconds
+                        debug.log(`Request Queue (${
+                            this.ieeeAddr}): default expiration timeout set to ${this.pendingRequestTimeout}`);
+                    }
                     await Promise.all(this.endpoints.map(async e => e.sendPendingRequests(true)));
                     // We *must* end fast-poll when we're done sending things. Otherwise
                     // we cause undue power-drain.
@@ -335,11 +353,25 @@ class Device extends Entity {
             }
         }
 
+        // default: no timeout (messages expire immediately after first send attempt)
+        let pendingRequestTimeout = 0;
+        if((endpoints.filter((e): boolean => e.supportsInputCluster('genPollCtrl'))).length > 0) {
+            // default for devices that support genPollCtrl cluster (RX off when idle): 1 day
+            pendingRequestTimeout = 86400000;
+            /* istanbul ignore else */
+            if (entry.hasOwnProperty('checkinInterval')) {
+                // if the checkin interval is known, messages expire by default after one checkin interval
+                pendingRequestTimeout = entry.checkinInterval * 1000; // milliseconds
+            }
+        }
+        debug.log (`Request Queue (${ieeeAddr}): default expiration timeout set to ${pendingRequestTimeout}`);
+
         return new Device(
             databaseID, entry.id, entry.type, ieeeAddr, networkAddress, entry.manufId, endpoints,
             entry.manufName, entry.powerSource, entry.modelId, entry.appVersion,
             entry.stackVersion, entry.zclVersion, entry.hwVersion, entry.dateCode, entry.swBuildId,
-            entry.interviewCompleted, meta, entry.lastSeen || null, defaultSendRequestWhen
+            entry.interviewCompleted, meta, entry.lastSeen || null, defaultSendRequestWhen, entry.checkinInterval,
+            pendingRequestTimeout
         );
     }
 
@@ -357,6 +389,7 @@ class Device extends Entity {
             stackVersion: this.stackVersion, hwVersion: this.hardwareVersion, dateCode: this.dateCode,
             swBuildId: this.softwareBuildID, zclVersion: this.zclVersion, interviewCompleted: this.interviewCompleted,
             meta: this.meta, lastSeen: this.lastSeen, defaultSendRequestWhen: this.defaultSendRequestWhen,
+            checkinInterval: this.checkinInterval
         };
     }
 
@@ -437,7 +470,7 @@ class Device extends Entity {
         const device = new Device(
             databaseID, ID, type, ieeeAddr, networkAddress, manufacturerID, endpointsMapped, manufacturerName,
             powerSource, modelID, undefined, undefined, undefined, undefined, undefined, undefined,
-            interviewCompleted, {}, null, 'immediate',
+            interviewCompleted, {}, null, 'immediate', undefined, 0
         );
 
         database.insert(device.toDatabaseEntry());
@@ -732,7 +765,9 @@ class Device extends Entity {
             for (const endpoint of this.endpoints.filter((e): boolean => e.supportsInputCluster('genPollCtrl'))) {
                 debug.log(`Interview - Poll control - binding '${this.ieeeAddr}' endpoint '${endpoint.ID}'`);
                 await endpoint.bind('genPollCtrl', coordinator.endpoints[0]);
-                const pollPeriod = await endpoint.read('genPollCtrl', ['checkinInterval']);
+                const pollPeriod = await endpoint.read('genPollCtrl', ['checkinInterval'], {sendWhen: 'immediate'});
+                this._checkinInterval = pollPeriod.checkinInterval / 4; // convert to seconds
+                this.pendingRequestTimeout = this._checkinInterval * 1000; // milliseconds
                 if (pollPeriod.checkinInterval <= 2400) {// 10 minutes
                     this.defaultSendRequestWhen = 'fastpoll';
                 } else {
