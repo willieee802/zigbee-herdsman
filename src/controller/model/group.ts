@@ -6,7 +6,6 @@ import Endpoint from './endpoint';
 import Device from './device';
 import assert from 'assert';
 import Debug from "debug";
-import {Adapter} from '../../adapter';
 
 const debug = {
     info: Debug('zigbee-herdsman:controller:group'),
@@ -158,7 +157,7 @@ class Group extends Entity {
      */
 
     public async write(
-        clusterKey: number | string, attributes: KeyValue, adapter: Adapter, options?: Options
+        clusterKey: number | string, attributes: KeyValue, options?: Options
     ): Promise<void> {
         options = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
         const cluster = Zcl.Utils.getCluster(clusterKey);
@@ -183,7 +182,7 @@ class Group extends Entity {
                 options.manufacturerCode, options.transactionSequenceNumber ?? ZclTransactionSequenceNumber.next(),
                 'write', cluster.ID, payload, options.reservedBits
             );
-            await adapter.sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
+            await Entity.getAdapterByID(this.databaseID).sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
         } catch (error) {
             error.message = `${log} failed (${error.message})`;
             debug.error(error.message);
@@ -192,7 +191,7 @@ class Group extends Entity {
     }
 
     public async read(
-        clusterKey: number | string, attributes: string[] | number [], adapter: Adapter, options?: Options
+        clusterKey: number | string, attributes: string[] | number [], options?: Options
     ): Promise<void> {
         options = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
         const cluster = Zcl.Utils.getCluster(clusterKey);
@@ -211,7 +210,7 @@ class Group extends Entity {
         debug.info(log);
 
         try {
-            await adapter.sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
+            await Entity.getAdapterByID(this.databaseID).sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
         } catch (error) {
             error.message = `${log} failed (${error.message})`;
             debug.error(error.message);
@@ -220,7 +219,7 @@ class Group extends Entity {
     }
 
     public async command(
-        clusterKey: number | string, commandKey: number | string, payload: KeyValue, adapter: Adapter, options?: Options
+        clusterKey: number | string, commandKey: number | string, payload: KeyValue, options?: Options
     ): Promise<void> {
         options = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
         const cluster = Zcl.Utils.getCluster(clusterKey);
@@ -235,7 +234,7 @@ class Group extends Entity {
                 options.transactionSequenceNumber || ZclTransactionSequenceNumber.next(),
                 command.ID, cluster.ID, payload, options.reservedBits
             );
-            await adapter.sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
+            await Entity.getAdapterByID(this.databaseID).sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
         } catch (error) {
             error.message = `${log} failed (${error.message})`;
             debug.error(error.message);
