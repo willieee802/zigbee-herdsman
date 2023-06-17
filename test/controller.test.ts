@@ -16,6 +16,8 @@ import {Wait} from '../src/utils';
 import * as Models from "../src/models";
 import * as Utils from "../src/utils";
 import { isTypedArray } from "util/types";
+import Bonjour, {BrowserConfig, Service} from 'bonjour-service';
+import {LoggerStub} from "../src/controller/logger-stub";
 const globalSetImmediate = setImmediate;
 const flushPromises = () => new Promise(globalSetImmediate);
 
@@ -483,7 +485,7 @@ describe('Controller', () => {
     let controller;
 
     beforeAll(async () => {
-        jest.useFakeTimers();
+        jest.useFakeTimers({doNotFake: ['setTimeout']});
         Date.now = jest.fn()
         Date.now.mockReturnValue(150);
         dummyBackup = await Utils.BackupUtils.toUnifiedBackup(mockDummyBackup);
@@ -3391,6 +3393,161 @@ describe('Controller', () => {
         expect(ZStackAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/test", "rtscts": false, adapter: null}, null, null, undefined);
     });
 
+    it('Adapter mdns timeout test', async () => {
+        const fakeAdapterName = 'mdns_test_device';
+        const mockLoggerDebug = jest.fn();
+        const mockLoggerInfo = jest.fn();
+        const mockLoggerWarn = jest.fn();
+        const mockLoggerError = jest.fn();
+        const mockLogger: LoggerStub = {
+            debug: mockLoggerDebug,
+            info: mockLoggerInfo,
+            warn: mockLoggerWarn,
+            error: mockLoggerError
+        };
+        let error;
+        try {
+            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+        } catch(e) {
+            error = e;
+        }
+        expect(error).toStrictEqual(new Error(`Coordinator [${fakeAdapterName}] not found after timeout of 2000ms!`));
+    });
+
+    it('Adapter mdns without type test', async () => {
+        const fakeAdapterName = '';
+        const mockLoggerDebug = jest.fn();
+        const mockLoggerInfo = jest.fn();
+        const mockLoggerWarn = jest.fn();
+        const mockLoggerError = jest.fn();
+        const mockLogger: LoggerStub = {
+            debug: mockLoggerDebug,
+            info: mockLoggerInfo,
+            warn: mockLoggerWarn,
+            error: mockLoggerError
+        };
+        let error;
+        try {
+            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+        } catch(e) {
+            error = e;
+        }
+        expect(error).toStrictEqual(new Error(
+            `No mdns device specified. You must specify the coordinator mdns service type after mdns://, e.g. mdns://my-adapter`
+        ));
+    });
+
+    it('Adapter mdns wrong Zeroconf test', async () => {
+        const fakeAdapterName = 'mdns_test_device';
+        const fakeIp = '111.111.111.111';
+        const fakePort = 6638;
+        const fakeRadio = 'znp';
+        const fakeRadioDetected = fakeRadio == 'znp' ? 'zstack' : fakeRadio;
+        const fakeBaud = '115200';
+
+        const mockLoggerDebug = jest.fn();
+        const mockLoggerInfo = jest.fn();
+        const mockLoggerWarn = jest.fn();
+        const mockLoggerError = jest.fn();
+        const mockLogger: LoggerStub = {
+            debug: mockLoggerDebug,
+            info: mockLoggerInfo,
+            warn: mockLoggerWarn,
+            error: mockLoggerError
+        };
+
+        Bonjour.prototype.findOne = function(opts?: BrowserConfig | undefined, timeout?: number, callback?: CallableFunction) {
+            setTimeout(() => {
+                callback({name: 'fakeAdapter', type: fakeAdapterName, port: fakePort, addresses: [fakeIp], txt: {baud_rate: fakeBaud}});
+            }, 200);
+        }
+
+        let error;
+        try {
+            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+        } catch(e) {
+            error = e;
+        }
+        expect(error).toStrictEqual(new Error(
+            `Coordinator returned wrong Zeroconf format! The following values are expected:\n` +
+            `txt.radio_type, got: undefined\n` +
+            `txt.baud_rate, got: 115200\n` +
+            `address, got: 111.111.111.111\n` +
+            `port, got: 6638`
+        ));
+        
+    });
+
+    it('Adapter mdns detection ezsp test', async () => {
+        const fakeAdapterName = 'mdns_test_device';
+        const fakeIp = '111.111.111.111';
+        const fakePort = 6638;
+        const fakeRadio = 'ezsp';
+        const fakeRadioDetected = fakeRadio == 'znp' ? 'zstack' : fakeRadio;
+        const fakeBaud = '115200';
+
+        const mockLoggerDebug = jest.fn();
+        const mockLoggerInfo = jest.fn();
+        const mockLoggerWarn = jest.fn();
+        const mockLoggerError = jest.fn();
+        const mockLogger: LoggerStub = {
+            debug: mockLoggerDebug,
+            info: mockLoggerInfo,
+            warn: mockLoggerWarn,
+            error: mockLoggerError
+        };
+
+        Bonjour.prototype.findOne = function(opts?: BrowserConfig | undefined, timeout?: number, callback?: CallableFunction) {
+            setTimeout(() => {
+                callback({name: 'fakeAdapter', type: fakeAdapterName, port: fakePort, addresses: [fakeIp], txt: {radio_type: fakeRadio, baud_rate: fakeBaud}});
+            }, 200);
+        }
+
+        await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+
+        expect(mockLoggerInfo.mock.calls[0][0]).toBe(`Starting mdns discovery for coordinator: ${fakeAdapterName}`);
+        expect(mockLoggerInfo.mock.calls[1][0]).toBe(`Coordinator Ip: ${fakeIp}`);
+        expect(mockLoggerInfo.mock.calls[2][0]).toBe(`Coordinator Port: ${fakePort}`);
+        expect(mockLoggerInfo.mock.calls[3][0]).toBe(`Coordinator Radio: ${fakeRadioDetected}`);
+        expect(mockLoggerInfo.mock.calls[4][0]).toBe(`Coordinator Baud: ${fakeBaud}\n`);
+        
+    });
+
+    it('Adapter mdns detection zstack test', async () => {
+        const fakeAdapterName = 'mdns_test_device';
+        const fakeIp = '111.111.111.111';
+        const fakePort = 6638;
+        const fakeRadio = 'znp';
+        const fakeRadioDetected = fakeRadio == 'znp' ? 'zstack' : fakeRadio;
+        const fakeBaud = '115200';
+
+        const mockLoggerDebug = jest.fn();
+        const mockLoggerInfo = jest.fn();
+        const mockLoggerWarn = jest.fn();
+        const mockLoggerError = jest.fn();
+        const mockLogger: LoggerStub = {
+            debug: mockLoggerDebug,
+            info: mockLoggerInfo,
+            warn: mockLoggerWarn,
+            error: mockLoggerError
+        };
+
+        Bonjour.prototype.findOne = function(opts?: BrowserConfig | undefined, timeout?: number, callback?: CallableFunction) {
+            setTimeout(() => {
+                callback({name: 'fakeAdapter', type: fakeAdapterName, port: fakePort, addresses: [fakeIp], txt: {radio_type: fakeRadio, baud_rate: fakeBaud}});
+            }, 200);
+        }
+
+        await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+
+        expect(mockLoggerInfo.mock.calls[0][0]).toBe(`Starting mdns discovery for coordinator: ${fakeAdapterName}`);
+        expect(mockLoggerInfo.mock.calls[1][0]).toBe(`Coordinator Ip: ${fakeIp}`);
+        expect(mockLoggerInfo.mock.calls[2][0]).toBe(`Coordinator Port: ${fakePort}`);
+        expect(mockLoggerInfo.mock.calls[3][0]).toBe(`Coordinator Radio: ${fakeRadioDetected}`);
+        expect(mockLoggerInfo.mock.calls[4][0]).toBe(`Coordinator Baud: ${fakeBaud}\n`);
+        
+    });
+
     it('Adapter create auto detect nothing found', async () => {
         mockZStackAdapterIsValidPath.mockReturnValueOnce(false);
         mockZStackAdapterAutoDetectPath.mockReturnValueOnce(null);
@@ -4262,6 +4419,7 @@ describe('Controller', () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         const device = controller.getDeviceByIeeeAddr('0x129');
+        device.pendingRequestTimeout = 10000;
         const endpoint = device.getEndpoint(1);
         mocksendZclFrameToEndpoint.mockClear();
         mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Dogs barking too hard');});
@@ -4271,8 +4429,8 @@ describe('Controller', () => {
         // We need to send the data after it's been queued, but before we await
         // the promise. Hijacking queueRequest seems easiest.
         const origQueueRequest = endpoint.queueRequest;
-        endpoint.queueRequest = async (req, d) => {
-            const f = origQueueRequest.call(endpoint, req, d, 'active');
+        endpoint.queueRequest = async (req) => {
+            const f = origQueueRequest.call(endpoint, req);
 
             const data = {
                 wasBroadcast: false,
@@ -4293,14 +4451,24 @@ describe('Controller', () => {
 
     it('Write with sendWhen active when pending', async () => {
         await controller.start();
-        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        await mockAdapterEvents['deviceJoined']({networkAddress: 174, ieeeAddr: '0x129'});
         const device = controller.getDeviceByIeeeAddr('0x129');
+        device.pendingRequestTimeout = 10000;
         const endpoint = device.getEndpoint(1);
+        // We need to wait for the data to be queued
+        const origQueueRequest = endpoint.queueRequest;
+        endpoint.queueRequest = async (req) => {
+            const f = origQueueRequest.call(endpoint, req);
+            jest.advanceTimersByTime(10);
+            return f;
+        };
         endpoint.pendingRequests.add(new Request(async () => {}, [], 100));
         mocksendZclFrameToEndpoint.mockClear();
-        mocksendZclFrameToEndpoint.mockReturnValueOnce(null)
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Dogs barking too hard');});
+        mocksendZclFrameToEndpoint.mockReturnValueOnce(null);
+        const nextTick = new Promise (process.nextTick);
         const result = endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true, sendWhen: 'active'});
-        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
 
         const data = {
             wasBroadcast: false,
@@ -4310,25 +4478,35 @@ describe('Controller', () => {
             linkquality: 50,
             groupID: 1,
         }
-
+        await nextTick;
         await mockAdapterEvents['zclData'](data);
         await result;
-        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
         expect((await result)).toBe(undefined);
         await mockAdapterEvents['zclData'](data);
-        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
     });
 
     it('Write with sendWhen active error', async () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         const device = controller.getDeviceByIeeeAddr('0x129');
+        device.pendingRequestTimeout = 10000;
         const endpoint = device.getEndpoint(1);
+        // We need to wait for the data to be queued
+        const origQueueRequest = endpoint.queueRequest;
+        endpoint.queueRequest = async (req) => {
+            const f = origQueueRequest.call(endpoint, req);
+            jest.advanceTimersByTime(10);
+            return f;
+        };
         endpoint.pendingRequests.add(new Request(async () => {}, [], 100));
         mocksendZclFrameToEndpoint.mockClear();
-        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Dogs barking too hard')});
+        mocksendZclFrameToEndpoint.mockImplementation(async () => {throw new Error('Dogs barking too hard')});
+        const nextTick = new Promise (process.nextTick);
         const result = endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true, sendWhen: 'active'});
-        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
+        await nextTick;
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
 
         let error = null;
         try {
@@ -4345,8 +4523,156 @@ describe('Controller', () => {
         } catch (e) {
             error = e;
         }
-        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
         expect(error.message).toStrictEqual(`Write 0x129/1 genOnOff({"onOff":1}, {"sendWhen":"active","timeout":10000,"disableResponse":true,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (Dogs barking too hard)`);
+    });
+
+    it('Write with sendWhen active, replace queued messages', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        device.pendingRequestTimeout = 10000;
+        const endpoint = device.getEndpoint(1);
+
+        // We need to wait for the data to be queued, but not for the promise to resolve
+        const origQueueRequest = endpoint.queueRequest;
+        endpoint.queueRequest = async (req) => {
+            const f = origQueueRequest.call(endpoint, req);
+            jest.advanceTimersByTime(10);
+            return f;
+        };
+
+        //add a request with empty data and a ZclFrame to the queue
+        endpoint.pendingRequests.add(new Request(async () => {}, [], 100));
+        // Queue content:
+        // 1. empty request
+        mocksendZclFrameToEndpoint.mockClear();
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Error one')});
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Error two')});
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Error three')});
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Error four')});
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Error five')});
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Error six')});
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Error seven')});
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Error eight')});
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {});
+        mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Dogs barking too hard')});
+        mocksendZclFrameToEndpoint.mockReturnValueOnce( {frame: {Payload: new Array( {"attrId": 1, "attrData": "one", "status": 0})}});
+        mocksendZclFrameToEndpoint.mockReturnValueOnce( {frame: {Payload: new Array( {"attrId": 2, "attrData": "two", "status": 0})}});
+        mocksendZclFrameToEndpoint.mockReturnValueOnce( {frame: {Payload: new Array( {"attrId": 3, "attrData": "three", "status": 0})}});
+        mocksendZclFrameToEndpoint.mockReturnValueOnce( {frame: {Payload: new Array( {"attrId": 4, "attrData": "four", "status": 0})}});
+        let result1, result2: Promise <any>;
+        endpoint.write('genOnOff', {onOff: 0, startUpOnOff: 0}, {disableResponse: true, sendWhen: 'active'});
+        await new Promise (process.nextTick);
+        // Queue content:
+        // 1. empty
+        // 2. ZCL write 'genOnOff' {onOff: 0, startUpOnOff: 0}
+        expect(endpoint.pendingRequests.size).toStrictEqual (2);
+        result1 = endpoint.write('genOnOff', {onOff: 0}, {disableResponse: true, sendWhen: 'active'});
+        await new Promise (process.nextTick);
+        // Queue content:
+        // 1. empty
+        // 2. ZCL write 'genOnOff' {startUpOnOff: 0}
+        // 3. ZCL write 'genOnOff' {onOff: 0} --> result1
+        expect(endpoint.pendingRequests.size).toStrictEqual (3);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
+
+        //add another non-ZCL request, should go directly to queue without errors
+        const result6 = endpoint.sendRequest(5, [], (d) => {throw new Error(d+1);});
+        await new Promise (process.nextTick);
+        // Queue content:
+        // 1. empty
+        // 2. ZCL write 'genOnOff' {startUpOnOff: 0}
+        // 3. ZCL write 'genOnOff' {onOff: 0}
+        // 4. add 1
+        expect(endpoint.pendingRequests.size).toStrictEqual (4);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
+
+        let error = null;
+        try {
+            // Add the same ZCL request with different payload again, the first one should be rejected and removed from the queue
+            result2 = endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true, sendWhen: 'active'});
+            expect (await result1).rejects.toBe("asas");
+        } catch (e) {
+            error = e;
+            // Queue content:
+            // 1. empty
+            // 2. ZCL write 'genOnOff' {startUpOnOff: 0}
+            // 3. add 1
+            // 4. ZCL write 'genOnOff' {onOff: 1} --> result2
+            expect(endpoint.pendingRequests.size).toStrictEqual (4);
+        }
+        // Now add the same ZCL request with same payload again. The previous one should *not* be rejected but removed from the queue
+        const result3 = endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true, sendWhen: 'active'});
+        await new Promise (process.nextTick);
+        // Queue content:
+        // 1. empty
+        // 2. ZCL write 'genOnOff' {startUpOnOff: 0}
+        // 3. add 1
+        // 4. ZCL write 'genOnOff' {onOff: 1} --> result2, result3
+        expect(endpoint.pendingRequests.size).toStrictEqual (4);
+
+        // writeUndiv request should not be divided, so both should go to the queue
+        endpoint.write('genOnOff', {onOff: 0, startUpOnOff: 0}, {disableResponse: true, sendWhen: 'active', writeUndiv: true});
+        await new Promise (process.nextTick);
+        endpoint.write('genOnOff', {startUpOnOff: 1}, {disableResponse: true, sendWhen: 'active', writeUndiv: true});
+        await new Promise (process.nextTick);
+        // Queue content:
+        // 1. empty
+        // 2. ZCL write 'genOnOff' {startUpOnOff: 0}
+        // 3. add 1
+        // 4. ZCL write 'genOnOff' {onOff: 1} --> result2, result3
+        // 5. ZCL writeUndiv 'genOnOff' {onOff: 0, startUpOnOff: 0}
+        // 6. ZCL writeUndiv 'genOnOff' {startUpOnOff: 1}
+        expect(endpoint.pendingRequests.size).toStrictEqual (6);
+
+        // read requests should be combined to one
+        const result4 = endpoint.read('genOnOff', ['onOff'], {disableResponse: false, sendWhen: 'active'});
+        await new Promise (process.nextTick);
+        const result5 = endpoint.read('genOnOff', ['onOff'], {disableResponse: false, sendWhen: 'active'});
+        await new Promise (process.nextTick);
+        // Queue content:
+        // 1. empty
+        // 2. ZCL write 'genOnOff' {startUpOnOff: 0}
+        // 3. add 1
+        // 4. ZCL write 'genOnOff' {onOff: 1} --> result2, result3
+        // 5. ZCL writeUndiv 'genOnOff' {onOff: 0, startUpOnOff: 0}
+        // 6. ZCL writeUndiv 'genOnOff' {startUpOnOff: 1}
+        // 7. ZCL read 'genOnOff' --> result4, result5
+        expect(endpoint.pendingRequests.size).toStrictEqual (7);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(8);
+
+        try {
+            // Implicit checkin, there are 5 ZclFrames and 2 other requests left in the queue:
+            await mockAdapterEvents['zclData']({
+                wasBroadcast: false,
+                address: '0x129',
+                frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+                endpoint: 1,
+                linkquality: 50,
+                groupID: 1,
+            });
+
+            await result6;
+        } catch (e) {
+            try {
+                await result3;
+            } catch (e) {
+                try {
+                    await result2;
+                } catch(e) {
+                    error = e;
+                }
+            }
+        }
+        expect (result4).resolves.toStrictEqual({"3": "three"});
+        expect (result5).resolves.toStrictEqual({"3": "three"});
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(13);
+        expect(mocksendZclFrameToEndpoint.mock.calls[8][3].Payload).toStrictEqual ([{"attrData": 0, "attrId": 16387, "dataType": 48}]);
+        expect(mocksendZclFrameToEndpoint.mock.calls[9][3].Payload).toStrictEqual ([{"attrData": 1, "attrId": 0, "dataType": 16}]);
+        expect(mocksendZclFrameToEndpoint.mock.calls[10][3].Payload).toStrictEqual ([{"attrData": 0, "attrId": 0, "dataType": 16}, {"attrData": 0, "attrId": 16387, "dataType": 48}]);
+        expect(mocksendZclFrameToEndpoint.mock.calls[11][3].Payload).toStrictEqual ([{"attrData": 1, "attrId": 16387, "dataType": 48}]);
+        expect(error.message).toStrictEqual(`Write 0x129/1 genOnOff({"onOff":1}, {"sendWhen":"active","timeout":10000,"disableResponse":true,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (Write 0x129/1 genOnOff({"onOff":1}, {"sendWhen":"active","timeout":10000,"disableResponse":true,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (Dogs barking too hard))`);
     });
 
     it('Write with sendWhen active, discard messages after expiration', async () => {
@@ -4355,19 +4681,19 @@ describe('Controller', () => {
         await mockAdapterEvents['deviceJoined']({networkAddress: 174, ieeeAddr: '0x174'});
         const device = controller.getDeviceByIeeeAddr('0x174');
         mockDevices[174].attributes[1].checkinInterval = 3996; //999 seconds
+
         await device.interview();
         const endpoint = device.getEndpoint(1);
         expect(device.checkinInterval).toBe(999);
+        expect(device.pendingRequestTimeout).toBe(999000);
         mocksendZclFrameToEndpoint.mockClear();
         mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {  throw new Error('Dogs barking too hard');});
 
-        endpoint.pendingRequests.add(new Request(async () => {}, [], 100));
-        const result = endpoint.write('genOnOff', {onOff: 10}, {disableResponse: true, sendWhen: 'active'});
-        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
-
-        Date.now.mockReturnValue(1001000);
-        let error = null;
-        try {
+        // We need to send the data after it's been queued, but before we await
+        // the promise. Hijacking queueRequest seems easiest.
+        const origQueueRequest = endpoint.queueRequest;
+        endpoint.queueRequest = async (req) => {
+            const f = origQueueRequest.call(endpoint, req);
 
             await mockAdapterEvents['zclData']({
                 wasBroadcast: false,
@@ -4378,11 +4704,21 @@ describe('Controller', () => {
                 groupID: 1,
 
             });
+            return f;
+        };
+
+        endpoint.pendingRequests.add(new Request(async () => {}, [], 100));
+        const result = endpoint.write('genOnOff', {onOff: 10}, {disableResponse: true, sendWhen: 'active'});
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
+
+        Date.now.mockReturnValue(1001000);
+        let error = null;
+        try {
             await result;
         } catch (e) {
             error = e;
         }
-        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         expect(endpoint.pendingRequests.size).toBe(0);
         Date.now.mockReturnValue(150);
     });
@@ -4393,30 +4729,37 @@ describe('Controller', () => {
         const device = controller.getDeviceByIeeeAddr('0x174');
         await device.interview();
         mocksendZclFrameToEndpoint.mockClear();
+        mocksendZclFrameToEndpoint.mockImplementationOnce(() => {throw new Error("dogs barking too hard");});
         const endpoint = device.getEndpoint(1);
+        const origQueueRequest = endpoint.queueRequest;
+        endpoint.queueRequest = async (req) => {
+            const f = origQueueRequest.call(endpoint, req);
+            jest.advanceTimersByTime(10);
+            return f;
+        };
         endpoint.pendingRequests.add(new Request(async () => {
             await endpoint.sendPendingRequests(false);}, [], 100));
+        const nextTick = new Promise (process.nextTick);
         const result = endpoint.write('genOnOff', {onOff: 10}, {disableResponse: true, sendWhen: 'active'});
+        await nextTick;
         await endpoint.sendPendingRequests(false);
         await result;
-        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
         expect(endpoint.pendingRequests.size).toBe(0);
     });
 
-    it('Fast polling', async () => {
+      it('Write with sendWhen active, send bulk messages', async () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 174, ieeeAddr: '0x174'});
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         const device = controller.getDeviceByIeeeAddr('0x174');
         const target = controller.getDeviceByIeeeAddr('0x129');
         await device.interview();
-
         const endpoint = device.getEndpoint(1);
-        endpoint.pendingRequests.add(new Request(async () => {}, [], 100, 'fastpoll', undefined, undefined, () => {}, () => {}));
         mocksendZclFrameToEndpoint.mockClear();
         mocksendZclFrameToEndpoint.mockReturnValueOnce(null);
 
-        const result = endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true});
+        const result = endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true, sendPolicy:'bulk'});
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
 
         await mockAdapterEvents['zclData']({
@@ -4467,6 +4810,73 @@ describe('Controller', () => {
         expect(fastpollstop[3].Payload).toStrictEqual({});
 
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(3);
+    });
+
+    it('Fast polling', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 174, ieeeAddr: '0x174'});
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x174');
+        const target = controller.getDeviceByIeeeAddr('0x129');
+        await device.interview();
+
+        const endpoint = device.getEndpoint(1);
+        endpoint.pendingRequests.add(new Request(async () => {}, [], 100, 'fastpoll', undefined, undefined, () => {}, () => {}));
+        mocksendZclFrameToEndpoint.mockClear();
+        mocksendZclFrameToEndpoint.mockImplementationOnce(() => {throw new Error("dogs barking too hard");});
+        mocksendZclFrameToEndpoint.mockReturnValueOnce(null);
+
+        const result = endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true});
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
+
+        await mockAdapterEvents['zclData']({
+            wasBroadcast: false,
+            address: 174,
+            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+            endpoint: 1,
+            linkquality: 50,
+            groupID: 1,
+
+        });
+
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
+
+        await mockAdapterEvents['zclData']({
+            wasBroadcast: false,
+            address: 174,
+            frame: ZclFrame.create(Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, true, 1, 1, 'checkin', Zcl.Utils.getCluster("genPollCtrl").ID, {}, 0),
+            endpoint: 1,
+            linkquality: 52,
+            groupID: undefined,
+        });
+
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
+
+        const checkinrsp = mocksendZclFrameToEndpoint.mock.calls[1];
+        expect(checkinrsp[0]).toBe('0x174');
+        expect(checkinrsp[1]).toBe(174);
+        expect(checkinrsp[2]).toBe(1);
+        expect(checkinrsp[3].Cluster.name).toBe('genPollCtrl');
+        expect(checkinrsp[3].Command.name).toBe('checkinRsp');
+        expect(checkinrsp[3].Payload).toStrictEqual({startFastPolling: true, fastPollTimeout: 0});
+
+        expect((await result)).toBe(undefined);
+
+        const cmd = mocksendZclFrameToEndpoint.mock.calls[2];
+        expect(cmd[0]).toBe('0x174');
+        expect(cmd[1]).toBe(174);
+        expect(cmd[2]).toBe(1);
+        expect(cmd[3].Cluster.name).toBe('genOnOff');
+
+        const fastpollstop = mocksendZclFrameToEndpoint.mock.calls[3];
+        expect(fastpollstop[0]).toBe('0x174');
+        expect(fastpollstop[1]).toBe(174);
+        expect(fastpollstop[2]).toBe(1);
+        expect(fastpollstop[3].Cluster.name).toBe('genPollCtrl');
+        expect(fastpollstop[3].Command.name).toBe('fastPollStop');
+        expect(fastpollstop[3].Payload).toStrictEqual({});
+
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(4);
     });
 
     it('Handle retransmitted Xiaomi messages', async () => {

@@ -1,8 +1,13 @@
-name: Update dependencies
+name: update-deps
+
 on:
   workflow_dispatch:
   schedule:
   - cron: "0 0 * * 0"
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   update_deps:
@@ -10,15 +15,15 @@ jobs:
     steps:
     - uses: actions/checkout@v3
       with:
-        ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+        token: ${{ secrets.GH_TOKEN }}
     - uses: actions/setup-node@v3
       with:
-        node-version: 18
-    - run: rm -rf package-lock.json
-    - run: npx npm-check-updates -u -x serialport # serialport is currently broken: https://github.com/Koenkk/zigbee-herdsman/issues/540
+        node-version: 20
+        cache: npm
+    - run: npx npm-check-updates -u
     - run: npm install
     - uses: peter-evans/create-pull-request@v5
       with:
-        commit-message: Update dependencies
-        branch: "update_deps"
+        commit-message: "fix(ignore): update dependencies"
+        branch: "deps/all"
         title: Update dependencies
