@@ -256,7 +256,7 @@ class EZSPAdapter extends Adapter {
     }
 
     public async addInstallCode(ieeeAddress: string, key: Buffer): Promise<void> {
-        if ([8, 10, 14, 18].indexOf(key.length) === -1) {
+        if ([8, 10, 14, 16, 18].indexOf(key.length) === -1) {
             throw new Error('Wrong install code length');
         }
         await this.driver.addInstallCode(ieeeAddress, key);
@@ -414,13 +414,11 @@ class EZSPAdapter extends Adapter {
         ieeeAddr: string, networkAddress: number, endpoint: number, zclFrame: ZclFrame, timeout: number,
         disableResponse: boolean, disableRecovery: boolean, sourceEndpoint?: number,
     ): Promise<Events.ZclDataPayload> {
-        return this.driver.queue.execute<Events.ZclDataPayload>(async () => {
-            this.checkInterpanLock();
-            return this.sendZclFrameToEndpointInternal(
-                ieeeAddr, networkAddress, endpoint, sourceEndpoint || 1, zclFrame, timeout, disableResponse,
-                disableRecovery, 0, 0, false, false, false, null
-            );
-        }, networkAddress);
+        this.checkInterpanLock();
+        return this.sendZclFrameToEndpointInternal(
+            ieeeAddr, networkAddress, endpoint, sourceEndpoint || 1, zclFrame, timeout, disableResponse,
+            disableRecovery, 0, 0, false, false, false, null
+        );
     }
 
     private async sendZclFrameToEndpointInternal(
@@ -529,16 +527,25 @@ class EZSPAdapter extends Adapter {
         return this.driver.queue.execute<void>(async () => {
             this.checkInterpanLock();
             const ieee = new EmberEUI64(sourceIeeeAddress);
-            const addrmode = (type === 'group') ? 1 : 3;
-            const ieeeDst = (type === 'group') ? destinationAddressOrGroup : 
-                new EmberEUI64(destinationAddressOrGroup as string);
-            if (type !== 'group') {
-                this.driver.setNode(destinationNetworkAddress, ieeeDst as EmberEUI64);
+            let destAddr;
+            if (type === 'group') {
+                // 0x01 = 16-bit group address for DstAddr and DstEndpoint not present
+                destAddr = {
+                    addrmode: 0x01,
+                    nwk: destinationAddressOrGroup,
+                }
+            } else {
+                // 0x03 = 64-bit extended address for DstAddr and DstEndpoint present
+                destAddr = {
+                    addrmode: 0x03,
+                    ieee: new EmberEUI64(destinationAddressOrGroup as string),
+                    endpoint: destinationEndpoint,
+                }
+                this.driver.setNode(destinationNetworkAddress, destAddr.ieee);
             }
             await this.driver.zdoRequest(
                 destinationNetworkAddress, EmberZDOCmd.Bind_req, EmberZDOCmd.Bind_rsp,
-                {sourceEui: ieee, sourceEp: sourceEndpoint, clusterId: clusterID,
-                destAddr: {addrmode: addrmode, ieee: ieeeDst, endpoint: destinationEndpoint}}
+                {sourceEui: ieee, sourceEp: sourceEndpoint, clusterId: clusterID, destAddr: destAddr}
             );
         }, destinationNetworkAddress);
     }
@@ -551,16 +558,25 @@ class EZSPAdapter extends Adapter {
         return this.driver.queue.execute<void>(async () => {
             this.checkInterpanLock();
             const ieee = new EmberEUI64(sourceIeeeAddress);
-            const addrmode = (type === 'group') ? 1 : 3;
-            const ieeeDst = (type === 'group') ? destinationAddressOrGroup : 
-                new EmberEUI64(destinationAddressOrGroup as string);
-            if (type !== 'group') {
-                this.driver.setNode(destinationNetworkAddress, ieeeDst as EmberEUI64);
+            let destAddr;
+            if (type === 'group') {
+                // 0x01 = 16-bit group address for DstAddr and DstEndpoint not present
+                destAddr = {
+                    addrmode: 0x01,
+                    nwk: destinationAddressOrGroup,
+                }
+            } else {
+                // 0x03 = 64-bit extended address for DstAddr and DstEndpoint present
+                destAddr = {
+                    addrmode: 0x03,
+                    ieee: new EmberEUI64(destinationAddressOrGroup as string),
+                    endpoint: destinationEndpoint,
+                }
+                this.driver.setNode(destinationNetworkAddress, destAddr.ieee);
             }
             await this.driver.zdoRequest(
                 destinationNetworkAddress, EmberZDOCmd.Unbind_req, EmberZDOCmd.Unbind_rsp,
-                {sourceEui: ieee, sourceEp: sourceEndpoint, clusterId: clusterID,
-                    destAddr: {addrmode: addrmode, ieee: ieeeDst, endpoint: destinationEndpoint}}
+                {sourceEui: ieee, sourceEp: sourceEndpoint, clusterId: clusterID, destAddr: destAddr}
             );
         }, destinationNetworkAddress);
     }

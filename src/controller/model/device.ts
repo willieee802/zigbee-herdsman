@@ -314,9 +314,17 @@ class Device extends Entity {
             !commandHasResponse && !this._skipDefaultResponse && !alreadyResponded) {
             try {
                 this._lastDefaultResponseSequenceNumber = frame.Header.transactionSequenceNumber;
-                await endpoint.defaultResponse(
-                    frame.getCommand().ID, 0, frame.Cluster.ID, frame.Header.transactionSequenceNumber,
+                // In the ZCL it is not documented what the direction of the default response should be
+                // In https://github.com/Koenkk/zigbee2mqtt/issues/18096 a commandResponse (SERVER_TO_CLIENT)
+                // is send and the device expects a CLIENT_TO_SERVER back.
+                // Previously SERVER_TO_CLIENT was always used.
+                // Therefore for non-global commands we inverse the direction.                
+                const direction = frame.isGlobal() ? Zcl.Direction.SERVER_TO_CLIENT : (
+                    frame.Header.frameControl.direction === Zcl.Direction.CLIENT_TO_SERVER 
+                        ? Zcl.Direction.SERVER_TO_CLIENT : Zcl.Direction.CLIENT_TO_SERVER
                 );
+                await endpoint.defaultResponse(
+                    frame.getCommand().ID, 0, frame.Cluster.ID, frame.Header.transactionSequenceNumber, {direction});
             } catch (error) {
                 debug.error(`Default response to ${this.ieeeAddr} failed`);
             }
@@ -835,7 +843,8 @@ class Device extends Entity {
         // Zigbee does not have an official pining mechamism. Use a read request
         // of a mandatory basic cluster attribute to keep it as lightweight as
         // possible.
-        await this.endpoints[0].read('genBasic', ['zclVersion'], {disableRecovery});
+        const endpoint = this.endpoints.find((ep) => ep.inputClusters.includes(0)) ?? this.endpoints[0];
+        await endpoint.read('genBasic', ['zclVersion'], {disableRecovery});
     }
 }
 
