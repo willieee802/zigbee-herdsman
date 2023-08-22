@@ -432,14 +432,14 @@ class Device extends Entity {
         return Device.allByDatabaseID(databaseID).filter(d => d.type === type);
     }
 
-    // public static all(): Device[] {
-    //     Device.loadFromDatabaseIfNecessary();
-    //     const devices: Device[] = [];
-    //     Device.devices.forEach(deviceDB => {
-    //         devices.push(...Object.values(deviceDB).filter(d => !d._deleted));
-    //     });
-    //     return devices;
-    // }
+    public static all(): Device[] {
+        Device.loadFromDatabaseIfNecessary();
+        const devices: Device[] = [];
+        Device.devices.forEach(deviceDB => {
+            devices.push(...Object.values(deviceDB).filter(d => !d._deleted));
+        });
+        return devices;
+    }
 
     public static allByDatabaseID(databaseID: number): Device[] {
         Device.loadFromDatabaseIfNecessary();
