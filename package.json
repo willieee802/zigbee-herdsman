@@ -4,8 +4,8 @@
   },
   "dependencies": {
     "@serialport/bindings-cpp": "^12.0.1",
-    "@serialport/parser-delimiter": "^11.0.1",
-    "@serialport/stream": "^11.0.1",
+    "@serialport/parser-delimiter": "^12.0.0",
+    "@serialport/stream": "^12.0.0",
     "bonjour-service": "^1.1.1",
     "debounce": "^1.2.1",
     "debug": "^4.3.4",
@@ -23,10 +23,10 @@
     "@babel/plugin-proposal-object-rest-spread": "*",
     "@babel/preset-env": "*",
     "@babel/preset-typescript": "*",
-    "@types/debounce": "^1.2.1",
+    "@types/debounce": "^1.2.2",
     "@types/debug": "*",
     "@types/jest": "*",
-    "@types/mz": "^2.7.4",
+    "@types/mz": "^2.7.5",
     "@types/nedb": "*",
     "@types/node": "*",
     "@typescript-eslint/eslint-plugin": "*",
@@ -35,7 +35,7 @@
     "eslint": "*",
     "jest": "*",
     "regenerator-runtime": "*",
-    "typedoc": "^0.24.8",
+    "typedoc": "^0.25.1",
     "typedoc-plugin-markdown": "*",
     "typedoc-plugin-no-inherit": "*",
     "typedoc-plugin-sourcefile-url": "*",
@@ -59,7 +59,7 @@
     "eslint": "node_modules/.bin/eslint . --ext .ts --max-warnings=0",
     "docs": "typedoc --tsconfig typedoc-tsconfig.json"
   },
-  "version": "0.18.3",
+  "version": "0.19.2",
   "jest": {
     "coverageThreshold": {
       "global": {
