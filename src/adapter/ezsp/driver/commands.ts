@@ -28,6 +28,7 @@ import {/* Basic Types */
     EzspMfgTokenId,
     EzspStatus,
     EmberStatus,
+    EmberStackError,
     EmberEventUnits,
     EmberNodeType,
     EmberNetworkStatus,
@@ -77,6 +78,9 @@ import {/* Basic Types */
     EmberMultiAddress,
     EmberNeighbors,
     EmberRoutingTable,
+    EmberSecurityManagerContext,
+    EmberSecurityManagerNetworkKeyInfo,
+    SLStatus,
 } from './types';
 
 /* eslint-disable-next-line @typescript-eslint/no-explicit-any*/
@@ -1182,6 +1186,24 @@ export const FRAMES: {[key: string]: EZSPFrameDesc} = {
             keyStruct: EmberKeyStruct
         },
     },
+    exportKey: {
+        ID: 0x0114,
+        request: {
+            context: EmberSecurityManagerContext
+        },
+        response: {
+            keyData: EmberKeyData,
+            status: SLStatus,
+        },
+    },
+    getNetworkKeyInfo: {
+        ID: 0x0116,
+        request: null,
+        response: {
+            status: SLStatus,
+            networkKeyInfo: EmberSecurityManagerNetworkKeyInfo,
+        },
+    },
     switchNetworkKeyHandler: {
         ID: 0x006e, // 110
         request: null,
@@ -1289,6 +1311,17 @@ export const FRAMES: {[key: string]: EZSPFrameDesc} = {
         request: {
             partner: EmberEUI64,
             transientKey: EmberKeyData
+        },
+        response: {
+            status: EmberStatus
+        },
+    },
+    importTransientKey: {
+        ID: 0x0111,
+        request: {
+            partner: EmberEUI64,
+            transientKey: EmberKeyData,
+            flags: uint8_t
         },
         response: {
             status: EmberStatus
@@ -2239,7 +2272,7 @@ export const FRAMES: {[key: string]: EZSPFrameDesc} = {
         ID: 0x00C4,
         request: null,
         response: {
-            errorCode: uint8_t,
+            errorCode: EmberStackError,
             target: EmberNodeId
         },
         minV: 9

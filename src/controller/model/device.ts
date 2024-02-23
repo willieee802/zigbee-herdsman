@@ -1,4 +1,4 @@
-import {KeyValue, DatabaseEntry, DeviceType, SendRequestWhen} from '../tstype';
+import {KeyValue, DatabaseEntry, DeviceType} from '../tstype';
 import {Events as AdapterEvents} from '../../adapter';
 import ZclTransactionSequenceNumber from '../helpers/zclTransactionSequenceNumber';
 import Endpoint from './endpoint';
@@ -54,7 +54,6 @@ class Device extends Entity {
     private _skipDefaultResponse: boolean;
     private _skipTimeResponse: boolean;
     private _deleted: boolean;
-    private _defaultSendRequestWhen?: SendRequestWhen;
     private _lastDefaultResponseSequenceNumber: number;
     private _checkinInterval: number;
     private _pendingRequestTimeout: number;
@@ -103,11 +102,11 @@ class Device extends Entity {
     set skipDefaultResponse(skipDefaultResponse: boolean) {this._skipDefaultResponse = skipDefaultResponse;}
     get skipTimeResponse(): boolean {return this._skipTimeResponse;}
     set skipTimeResponse(skipTimeResponse: boolean) {this._skipTimeResponse = skipTimeResponse;}
-    get defaultSendRequestWhen(): SendRequestWhen {return this._defaultSendRequestWhen;}
-    set defaultSendRequestWhen(defaultSendRequestWhen: SendRequestWhen) {
-        this._defaultSendRequestWhen = defaultSendRequestWhen;
-    }
     get checkinInterval(): number {return this._checkinInterval;}
+    set checkinInterval(checkinInterval: number) {
+        this._checkinInterval = checkinInterval;
+        this.resetPendingRequestTimeout();
+    }
     get pendingRequestTimeout(): number {return this._pendingRequestTimeout;}
     set pendingRequestTimeout(pendingRequestTimeout: number) {this._pendingRequestTimeout = pendingRequestTimeout;}
 
@@ -138,7 +137,7 @@ class Device extends Entity {
         manufacturerID: number, endpoints: Endpoint[], manufacturerName: string,
         powerSource: string, modelID: string, applicationVersion: number, stackVersion: number, zclVersion: number,
         hardwareVersion: number, dateCode: string, softwareBuildID: string, interviewCompleted: boolean, meta: KeyValue,
-        lastSeen: number, defaultSendRequestWhen: SendRequestWhen, checkinInterval: number,
+        lastSeen: number, checkinInterval: number,
         pendingRequestTimeout: number
     ) {
         super();
@@ -164,7 +163,6 @@ class Device extends Entity {
         this._skipTimeResponse = false;
         this.meta = meta;
         this._lastSeen = lastSeen;
-        this._defaultSendRequestWhen = defaultSendRequestWhen;
         this._checkinInterval = checkinInterval;
         this._pendingRequestTimeout = pendingRequestTimeout;
     }
@@ -208,6 +206,12 @@ class Device extends Entity {
         this._lastSeen = Date.now();
     }
 
+    private resetPendingRequestTimeout(): void {
+        // pendingRequestTimeout can be changed dynamically at runtime, and it is not persisted.
+        // Default timeout is one checkin interval in milliseconds.
+        this._pendingRequestTimeout = this._checkinInterval * 1000;
+    }
+
     private hasPendingRequests(): boolean {
         return this.endpoints.find(e => e.hasPendingRequests()) !== undefined;
     }
@@ -217,8 +221,8 @@ class Device extends Entity {
 
         // Update reportable properties
         if (frame.isCluster('genBasic') && (frame.isCommand('readRsp') || frame.isCommand('report'))) {
-            for (const [key, value] of Object.entries(ZclFrameConverter.attributeKeyValue(frame))) {
-                Device.ReportablePropertiesMapping[key]?.set(value, this);
+            for (const [key, val] of Object.entries(ZclFrameConverter.attributeKeyValue(frame, this.manufacturerID))) {
+                Device.ReportablePropertiesMapping[key]?.set(val, this);
             }
         }
 
@@ -274,14 +278,14 @@ class Device extends Entity {
                         fastPollTimeout: 0,
                     };
                     debug.log(`check-in from ${this.ieeeAddr}: accepting fast-poll`);
-                    await endpoint.command(frame.Cluster.ID, 'checkinRsp', payload, {sendWhen: 'immediate'});
+                    await endpoint.command(frame.Cluster.ID, 'checkinRsp', payload, {sendPolicy: 'immediate'});
 
                     // This is a good time to read the checkin interval if we haven't stored it previously
                     if (this._checkinInterval === undefined) {
                         const pollPeriod =
-                            await endpoint.read('genPollCtrl', ['checkinInterval'], {sendWhen: 'immediate'});
+                            await endpoint.read('genPollCtrl', ['checkinInterval'], {sendPolicy: 'immediate'});
                         this._checkinInterval = pollPeriod.checkinInterval / 4; // convert to seconds
-                        this.pendingRequestTimeout = this._checkinInterval * 1000; // milliseconds
+                        this.resetPendingRequestTimeout();
                         debug.log(`Request Queue (${
                             this.ieeeAddr}): default expiration timeout set to ${this.pendingRequestTimeout}`);
                     }
@@ -289,14 +293,14 @@ class Device extends Entity {
                     // We *must* end fast-poll when we're done sending things. Otherwise
                     // we cause undue power-drain.
                     debug.log(`check-in from ${this.ieeeAddr}: stopping fast-poll`);
-                    await endpoint.command(frame.Cluster.ID, 'fastPollStop', {}, {sendWhen: 'immediate'});
+                    await endpoint.command(frame.Cluster.ID, 'fastPollStop', {}, {sendPolicy: 'immediate'});
                 } else {
                     const payload = {
                         startFastPolling: false,
                         fastPollTimeout: 0,
                     };
                     debug.log(`check-in from ${this.ieeeAddr}: declining fast-poll`);
-                    await endpoint.command(frame.Cluster.ID, 'checkinRsp', payload, {sendWhen: 'immediate'});
+                    await endpoint.command(frame.Cluster.ID, 'checkinRsp', payload, {sendPolicy: 'immediate'});
                 }
             } catch (error) {
                 /* istanbul ignore next */
@@ -348,19 +352,6 @@ class Device extends Entity {
             throw new Error('Cannot load device from group');
         }
 
-        let defaultSendRequestWhen: SendRequestWhen = entry.defaultSendRequestWhen;
-        /* istanbul ignore next */
-        if (defaultSendRequestWhen == null) {
-            // Guess defaultSendRequestWhen based on old useImplicitCheckin/defaultSendWhenActive
-            if (entry.hasOwnProperty('useImplicitCheckin') && !entry.useImplicitCheckin) {
-                defaultSendRequestWhen = 'fastpoll';
-            } else if (entry.hasOwnProperty('defaultSendWhenActive') &&  entry.defaultSendWhenActive) {
-                defaultSendRequestWhen = 'active';
-            } else {
-                defaultSendRequestWhen = 'immediate';
-            }
-        }
-
         // default: no timeout (messages expire immediately after first send attempt)
         let pendingRequestTimeout = 0;
         if((endpoints.filter((e): boolean => e.supportsInputCluster('genPollCtrl'))).length > 0) {
@@ -378,7 +369,7 @@ class Device extends Entity {
             databaseID, entry.id, entry.type, ieeeAddr, networkAddress, entry.manufId, endpoints,
             entry.manufName, entry.powerSource, entry.modelId, entry.appVersion,
             entry.stackVersion, entry.zclVersion, entry.hwVersion, entry.dateCode, entry.swBuildId,
-            entry.interviewCompleted, meta, entry.lastSeen || null, defaultSendRequestWhen, entry.checkinInterval,
+            entry.interviewCompleted, meta, entry.lastSeen || null, entry.checkinInterval,
             pendingRequestTimeout
         );
     }
@@ -396,8 +387,7 @@ class Device extends Entity {
             modelId: this.modelID, epList, endpoints, appVersion: this.applicationVersion,
             stackVersion: this.stackVersion, hwVersion: this.hardwareVersion, dateCode: this.dateCode,
             swBuildId: this.softwareBuildID, zclVersion: this.zclVersion, interviewCompleted: this.interviewCompleted,
-            meta: this.meta, lastSeen: this.lastSeen, defaultSendRequestWhen: this.defaultSendRequestWhen,
-            checkinInterval: this.checkinInterval
+            meta: this.meta, lastSeen: this.lastSeen, checkinInterval: this.checkinInterval
         };
     }
 
@@ -478,7 +468,7 @@ class Device extends Entity {
         const device = new Device(
             databaseID, ID, type, ieeeAddr, networkAddress, manufacturerID, endpointsMapped, manufacturerName,
             powerSource, modelID, undefined, undefined, undefined, undefined, undefined, undefined,
-            interviewCompleted, {}, null, 'immediate', undefined, 0
+            interviewCompleted, {}, null, undefined, 0
         );
 
         database.insert(device.toDatabaseEntry());
@@ -627,12 +617,9 @@ class Device extends Entity {
             // https://github.com/Koenkk/zigbee2mqtt/issues/7553
             debug.log("Interview - Detected potential TuYa end device, reading modelID and manufacturerName...");
             try {
-                const endpoint = Endpoint.create(this.databaseID, 1, undefined, undefined, [], [],
-                    this.networkAddress, this.ieeeAddr
-                );
-                const result = await endpoint.read('genBasic', ['modelId', 'manufacturerName'],
-                    {sendWhen: 'immediate'}
-                );
+                const endpoint = Endpoint.create(this.databaseID, 1, undefined, undefined, [], [], this.networkAddress, this.ieeeAddr);
+                const result = await endpoint.read('genBasic', ['modelId', 'manufacturerName'], 
+                    {sendPolicy: 'immediate'});
                 Object.entries(result)
                     .forEach((entry) => Device.ReportablePropertiesMapping[entry[0]].set(entry[1], this));
             } catch (error) {
@@ -686,7 +673,7 @@ class Device extends Entity {
                         try {
                             let result: KeyValue;
                             try {
-                                result = await endpoint.read('genBasic', [key], {sendWhen: 'immediate'});
+                                result = await endpoint.read('genBasic', [key], {sendPolicy: 'immediate'});
                             } catch (error) {
                                 // Reading attributes can fail for many reason, e.g. it could be that device rejoins
                                 // while joining like in:
@@ -696,7 +683,7 @@ class Device extends Entity {
                                     debug.log(`Interview - first ${item.key} retrieval attempt failed, ` +
                                         `retrying after 10 seconds...`);
                                     await Wait(10000);
-                                    result = await endpoint.read('genBasic', [key], {sendWhen: 'immediate'});
+                                    result = await endpoint.read('genBasic', [key], {sendPolicy: 'immediate'});
                                 } else {
                                     throw error;
                                 }
@@ -721,14 +708,15 @@ class Device extends Entity {
         for (const endpoint of this.endpoints.filter((e): boolean => e.supportsInputCluster('ssIasZone'))) {
             debug.log(`Interview - IAS - enrolling '${this.ieeeAddr}' endpoint '${endpoint.ID}'`);
 
-            const stateBefore = await endpoint.read('ssIasZone', ['iasCieAddr', 'zoneState'], {sendWhen: 'immediate'});
+            const stateBefore = await endpoint.read(
+                'ssIasZone', ['iasCieAddr', 'zoneState'], {sendPolicy: 'immediate'});
             debug.log(`Interview - IAS - before enrolling state: '${JSON.stringify(stateBefore)}'`);
 
             // Do not enroll when device has already been enrolled
             if (stateBefore.zoneState !== 1 || stateBefore.iasCieAddr !== coordinator.ieeeAddr) {
                 debug.log(`Interview - IAS - not enrolled, enrolling`);
 
-                await endpoint.write('ssIasZone', {'iasCieAddr': coordinator.ieeeAddr}, {sendWhen: 'immediate'});
+                await endpoint.write('ssIasZone', {'iasCieAddr': coordinator.ieeeAddr}, {sendPolicy: 'immediate'});
                 debug.log(`Interview - IAS - wrote iasCieAddr`);
 
                 // There are 2 enrollment procedures:
@@ -740,15 +728,14 @@ class Device extends Entity {
                 await Wait(500);
                 debug.log(`IAS - '${this.ieeeAddr}' sending enroll response (auto enroll)`);
                 const payload = {enrollrspcode: 0, zoneid: 23};
-                await endpoint.command('ssIasZone', 'enrollRsp', payload, 
-                    {disableDefaultResponse: true, sendWhen: 'immediate'}
-                );
+                await endpoint.command('ssIasZone', 'enrollRsp', payload,
+                    {disableDefaultResponse: true, sendPolicy: 'immediate'});
 
                 let enrolled = false;
                 for (let attempt = 0; attempt < 20; attempt++) {
                     await Wait(500);
                     const stateAfter = await endpoint.read('ssIasZone', ['iasCieAddr', 'zoneState'],
-                        {sendWhen: 'immediate'});
+                        {sendPolicy: 'immediate'});
                     debug.log(`Interview - IAS - after enrolling state (${attempt}): '${JSON.stringify(stateAfter)}'`);
                     if (stateAfter.zoneState === 1) {
                         enrolled = true;
@@ -773,14 +760,9 @@ class Device extends Entity {
             for (const endpoint of this.endpoints.filter((e): boolean => e.supportsInputCluster('genPollCtrl'))) {
                 debug.log(`Interview - Poll control - binding '${this.ieeeAddr}' endpoint '${endpoint.ID}'`);
                 await endpoint.bind('genPollCtrl', coordinator.endpoints[0]);
-                const pollPeriod = await endpoint.read('genPollCtrl', ['checkinInterval'], {sendWhen: 'immediate'});
+                const pollPeriod = await endpoint.read('genPollCtrl', ['checkinInterval'], {sendPolicy: 'immediate'});
                 this._checkinInterval = pollPeriod.checkinInterval / 4; // convert to seconds
-                this.pendingRequestTimeout = this._checkinInterval * 1000; // milliseconds
-                if (pollPeriod.checkinInterval <= 2400) {// 10 minutes
-                    this.defaultSendRequestWhen = 'fastpoll';
-                } else {
-                    this.defaultSendRequestWhen = 'active';
-                }
+                this.resetPendingRequestTimeout();
             }
         } catch (error) {
             /* istanbul ignore next */
@@ -799,13 +781,14 @@ class Device extends Entity {
                 Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, true,
                 null, ZclTransactionSequenceNumber.next(), 'pairing', 33, payload
             );
-
+            
             await Entity.getAdapterByID(this.databaseID).sendZclFrameToAll(242, frame, 242);
         } else await Entity.getAdapterByID(this.databaseID).removeDevice(this.networkAddress, this.ieeeAddr);
-        await this.removeFromDatabase();
+        this.removeFromDatabase();
+
     }
 
-    public async removeFromDatabase(): Promise<void> {
+    public removeFromDatabase(): void {
         Device.loadFromDatabaseIfNecessary();
         const database = Entity.getDatabaseByID(this.databaseID);
 

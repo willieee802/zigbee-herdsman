@@ -2,84 +2,86 @@
 import * as stream from 'stream';
 import * as consts from './consts';
 import Debug from "debug";
+import Frame from './frame';
 
 const debug = Debug('zigbee-herdsman:adapter:ezsp:uart');
 
 export class Parser extends stream.Transform {
-    private buffer: Buffer;
+    private tail: Buffer[];
+    private flagXONXOFF: boolean;
 
-    public constructor() {
+    public constructor(flagXONXOFF: boolean = false) {
         super();
-        this.buffer = Buffer.from([]);
+
+        this.flagXONXOFF = flagXONXOFF;
+        this.tail = [];
     }
 
     public _transform(chunk: Buffer, _: string, cb: () => void): void {
+        if (this.flagXONXOFF && (chunk.indexOf(consts.XON) >= 0 || chunk.indexOf(consts.XOFF) >= 0)) {
+            // XXX: should really throw, but just assert for now to flag potential problematic setups
+            console.assert(false, `Host driver did not remove XON/XOFF from input stream. Driver not setup for XON/XOFF?`);
+        }
+
         if (chunk.indexOf(consts.CANCEL) >= 0) {
-            this.buffer = Buffer.from([]);
+            this.reset();
             chunk = chunk.subarray(chunk.lastIndexOf(consts.CANCEL) + 1);
         }
+
         if (chunk.indexOf(consts.SUBSTITUTE) >= 0) {
-            this.buffer = Buffer.from([]);
+            this.reset();
             chunk = chunk.subarray(chunk.indexOf(consts.FLAG) + 1);
         }
-        debug(`<-- [${chunk.toString('hex')}]`);
-        this.buffer = Buffer.concat([this.buffer, chunk]);
-        this.parseNext();
-        cb();
-    }
 
-    private parseNext(): void {
-        if (this.buffer.length && this.buffer.indexOf(consts.FLAG) >= 0) {
-            //debug(`<-- [${this.buffer.toString('hex')}]`);
+        debug(`<-- [${chunk.toString('hex')}]`);
+
+        let delimiterPlace = chunk.indexOf(consts.FLAG);
+
+        while (delimiterPlace >= 0) {
+            const buffer = chunk.subarray(0, delimiterPlace + 1);
+            const frameBuffer = Buffer.from([...this.unstuff(Buffer.concat([...this.tail, buffer]))]);
+            this.reset();
+
             try {
-                const frame = this.extractFrame();
+                const frame = Frame.fromBuffer(frameBuffer);
+
                 if (frame) {
                     this.emit('parsed', frame);
                 }
+
             } catch (error) {
                 debug(`<-- error ${error.stack}`);
             }
-            this.parseNext();
-        }
-    }
 
-    private extractFrame(): Buffer {
-        /* Extract a frame from the data buffer */
-        const place = this.buffer.indexOf(consts.FLAG);
-        if (place >= 0) {
-            const result = this.unstuff(this.buffer.subarray(0, place + 1));
-            this.buffer = this.buffer.subarray(place + 1);
-            return result;
-        } else {
-            return null;
+            chunk = chunk.subarray(delimiterPlace + 1);
+            delimiterPlace = chunk.indexOf(consts.FLAG);
         }
-    }
 
-    private unstuff(s: Buffer): Buffer {
-        /* Unstuff (unescape) a string after receipt */
+        this.tail.push(chunk);
+        cb();
+    }
+ 
+    private* unstuff(buffer: Buffer): Generator<number> {
+        /* Unstuff (unescape) a buffer after receipt */
         let escaped = false;
-        const out = Buffer.alloc(s.length);
-        let outIdx = 0;
-        for (let idx = 0; idx < s.length; idx += 1) {
-            const c = s[idx];
+        for (const byte of buffer) {
             if (escaped) {
-                out.writeUInt8(c ^ consts.STUFF, outIdx++);
+                yield byte ^ consts.STUFF;
                 escaped = false;
             } else {
-                if (c === consts.ESCAPE) {
+                if (byte === consts.ESCAPE) {
                     escaped = true;
-                } else if (c === consts.XOFF || c === consts.XON) {
+                } else if (byte === consts.XOFF || byte === consts.XON) {
                     // skip
                 } else {
-                    out.writeUInt8(c, outIdx++);
+                    yield byte;
                 }
             }
         }
-        return out.subarray(0, outIdx);
     }
 
     public reset(): void {
-        // clear buffer
-        this.buffer = Buffer.from([]);
+        // clear tail
+        this.tail.length = 0;
     }
 }

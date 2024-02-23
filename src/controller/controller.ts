@@ -248,8 +248,10 @@ class Controller extends events.EventEmitter {
 
             // Zigbee 3 networks automatically close after max 255 seconds, keep network open.
             this.permitJoinNetworkClosedTimer = setInterval(async (): Promise<void> => {
-                await this.adapter.permitJoin(254, !device ? null : device.networkAddress);
-                await this.greenPower.permitJoin(254, !device ? null : device.networkAddress);
+                await catcho(async () => {
+                    await this.adapter.permitJoin(254, !device ? null : device.networkAddress);
+                    await this.greenPower.permitJoin(254, !device ? null : device.networkAddress);
+                }, "Failed to keep permit join alive");
             }, 200 * 1000);
 
             if (typeof time === 'number') {
@@ -651,7 +653,10 @@ class Controller extends events.EventEmitter {
         }
 
         device.updateLastSeen();
-        device.implicitCheckin();
+        //no implicit checkin for genPollCtrl data because it might interfere with the explicit checkin
+        if (!this.isZclDataPayload(dataPayload, dataType) || !dataPayload.frame.isCluster("genPollCtrl")) {
+            device.implicitCheckin();
+        }
         device.linkquality = dataPayload.linkquality;
 
         let endpoint = device.getEndpoint(dataPayload.endpoint);
@@ -684,18 +689,18 @@ class Controller extends events.EventEmitter {
             if (frame.isGlobal()) {
                 if (frame.isCommand('report')) {
                     type = 'attributeReport';
-                    data = ZclFrameConverter.attributeKeyValue(dataPayload.frame);
+                    data = ZclFrameConverter.attributeKeyValue(dataPayload.frame, device.manufacturerID);
                 } else if (frame.isCommand('read')) {
                     type = 'read';
-                    data = ZclFrameConverter.attributeList(dataPayload.frame);
+                    data = ZclFrameConverter.attributeList(dataPayload.frame, device.manufacturerID);
                 } else if (frame.isCommand('write')) {
                     type = 'write';
-                    data = ZclFrameConverter.attributeKeyValue(dataPayload.frame);
+                    data = ZclFrameConverter.attributeKeyValue(dataPayload.frame, device.manufacturerID);
                 } else {
                     /* istanbul ignore else */
                     if (frame.isCommand('readRsp')) {
                         type = 'readResponse';
-                        data = ZclFrameConverter.attributeKeyValue(dataPayload.frame);
+                        data = ZclFrameConverter.attributeKeyValue(dataPayload.frame, device.manufacturerID);
                     }
                 }
             } else {
@@ -746,7 +751,7 @@ class Controller extends events.EventEmitter {
 
 
         if (this.isZclDataPayload(dataPayload, dataType)) {
-            device.onZclData(dataPayload, endpoint);
+            await device.onZclData(dataPayload, endpoint);
         }
     }
 }

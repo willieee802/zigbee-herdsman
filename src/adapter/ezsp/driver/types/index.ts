@@ -43,6 +43,8 @@ import {
     EzspMfgTokenId,
     EzspStatus,
     EmberStatus,
+    SLStatus,
+    EmberStackError,
     EmberEventUnits,
     EmberNodeType,
     EmberNetworkStatus,
@@ -69,6 +71,7 @@ import {
     EzspSourceRouteOverheadInformation,
     EmberNetworkInitBitmask,
     EmberZDOCmd,
+    EmberDerivedKeyType,
 } from './named';
 
 import {
@@ -114,6 +117,8 @@ import {
     EmberNeighbors,
     EmberRoutingTable,
     EmberRoutingTableEntry,
+    EmberSecurityManagerContext,
+    EmberSecurityManagerNetworkKeyInfo,
 } from './struct';
 
 /* eslint-disable-next-line @typescript-eslint/no-explicit-any*/
@@ -175,6 +180,8 @@ export {
     EzspMfgTokenId,
     EzspStatus,
     EmberStatus,
+    SLStatus,
+    EmberStackError,
     EmberEventUnits,
     EmberNodeType,
     EmberNetworkStatus,
@@ -201,6 +208,7 @@ export {
     EzspSourceRouteOverheadInformation,
     EmberNetworkInitBitmask,
     EmberZDOCmd,
+    EmberDerivedKeyType,
 
     /* Structs */
     EzspStruct,
@@ -245,4 +253,6 @@ export {
     EmberNeighbors,
     EmberRoutingTable,
     EmberRoutingTableEntry,
+    EmberSecurityManagerContext,
+    EmberSecurityManagerNetworkKeyInfo,
 };
