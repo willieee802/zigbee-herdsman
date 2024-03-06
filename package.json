@@ -34,7 +34,7 @@
     "eslint": "*",
     "jest": "*",
     "regenerator-runtime": "*",
-    "typedoc": "^0.25.8",
+    "typedoc": "^0.25.9",
     "typedoc-plugin-markdown": "*",
     "typedoc-plugin-no-inherit": "*",
     "typescript": "*"
@@ -59,7 +59,7 @@
     "clean": "rimraf temp coverage dist",
     "prepack": "npm run clean && npm run build"
   },
-  "version": "0.34.3",
+  "version": "0.36.0",
   "jest": {
     "coverageThreshold": {
       "global": {

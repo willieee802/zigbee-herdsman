@@ -61,10 +61,8 @@ const ashGetACKNum = (ctrl: number): number => ((ctrl & ASH_ACKNUM_MASK) >> ASH_
 
 
 export enum AshEvents {
-    /** When the host detects a fatal error */
-    hostError = 'hostError',
-    /** When the NCP reports a fatal error */
-    ncpError = 'ncpError',
+    /** When the ASH protocol detects an error while receiving a frame. NOTE: TX errors are handled by the EZSP layer. */
+    rxError = 'rxError',
     /** When a frame has been parsed and queued in the rxQueue. */
     frame = 'frame',
 }
@@ -283,15 +281,15 @@ export class UartAsh extends EventEmitter {
     public ncpHasCallbacks: boolean;
 
     /** Transmit buffers */
-    private txPool: EzspBuffer[];
-    public txQueue: EzspQueue;
-    public reTxQueue: EzspQueue;
-    public txFree: EzspFreeList;
+    private readonly txPool: EzspBuffer[];
+    public readonly txQueue: EzspQueue;
+    public readonly reTxQueue: EzspQueue;
+    public readonly txFree: EzspFreeList;
 
     /** Receive buffers */
-    private rxPool: EzspBuffer[];
-    public rxQueue: EzspQueue;
-    public rxFree: EzspFreeList;
+    private readonly rxPool: EzspBuffer[];
+    public readonly rxQueue: EzspQueue;
+    public readonly rxFree: EzspFreeList;
 
     constructor(options: SerialPortOptions) {
         super();
@@ -320,7 +318,7 @@ export class UartAsh extends EventEmitter {
             return false;
         }
 
-        return this.serialPort != null ? this.serialPort.isOpen : !this.socketPort?.closed;
+        return SocketPortUtils.isTcpPath(this.portOptions.path) ? !this.socketPort?.closed : !!this.serialPort?.isOpen;
     }
 
     /**
@@ -367,10 +365,6 @@ export class UartAsh extends EventEmitter {
     private initVariables(): void {
         this.closing = false;
 
-        this.serialPort = null;
-        this.socketPort = null;
-        this.writer = null;
-        this.parser = null;
         this.txSHBuffer = Buffer.alloc(SH_TX_BUFFER_LEN);
         this.rxSHBuffer = Buffer.alloc(SH_RX_BUFFER_LEN);
         this.ackTimer = 0;
@@ -471,12 +465,14 @@ export class UartAsh extends EventEmitter {
         }
     }
 
+    /**
+     * Init the serial or socket port and hook parser/writer.
+     * NOTE: This is the only function that throws/rejects in the ASH layer (caught by resetNcp and turned into an EzspStatus).
+     */
     private async initPort(): Promise<void> {
-        if (!SocketPortUtils.isTcpPath(this.portOptions.path)) {
-            if (this.serialPort != null) {
-                this.serialPort.close();
-            }
+        await this.closePort();// will do nothing if nothing's open
 
+        if (!SocketPortUtils.isTcpPath(this.portOptions.path)) {
             const serialOpts = {
                 path: this.portOptions.path,
                 baudRate: typeof this.portOptions.baudRate === 'number' ? this.portOptions.baudRate : 115200, 
@@ -501,7 +497,7 @@ export class UartAsh extends EventEmitter {
                 serialOpts.binding = this.portOptions.binding;
             }
 
-            debug(`Opening SerialPort with ${JSON.stringify(serialOpts)}`);
+            debug(`Opening serial port with ${JSON.stringify(serialOpts)}`);
             this.serialPort = new SerialPort(serialOpts);
 
             this.writer = new AshWriter({highWaterMark: CONFIG_HIGHWATER_MARK});
@@ -513,7 +509,7 @@ export class UartAsh extends EventEmitter {
 
             try {
                 await this.serialPort.asyncOpen();
-                debug('Serialport opened');
+                debug(`Serial port opened: ${JSON.stringify(await this.serialPort.asyncGet())}`);
 
                 this.serialPort.once('close', this.onPortClose.bind(this));
                 this.serialPort.on('error', this.onPortError.bind(this));
@@ -523,10 +519,6 @@ export class UartAsh extends EventEmitter {
                 throw error;
             }
         } else {
-            if (this.socketPort != null) {
-                this.socketPort.destroy();
-            }
-
             const info = SocketPortUtils.parseTcpPath(this.portOptions.path);
             debug(`Opening TCP socket with ${info.host}:${info.port}`);
 
@@ -612,10 +604,15 @@ export class UartAsh extends EventEmitter {
 
         const status = this.receiveFrame(buffer);
 
-        if (status === EzspStatus.SUCCESS) {
-            // ?
-        } else if ((status !== EzspStatus.ASH_IN_PROGRESS) && (status !== EzspStatus.NO_RX_DATA)) {
-            throw new Error(EzspStatus[status]);
+        if ((status !== EzspStatus.SUCCESS) && (status !== EzspStatus.ASH_IN_PROGRESS) && (status !== EzspStatus.NO_RX_DATA)) {
+            if (this.flags & Flag.CONNECTED) {
+                console.error(`Error while parsing received frame, status=${EzspStatus[status]}.`);
+                // if we're connected (not in reset) and get here, we need to reset
+                this.emit(AshEvents.rxError, EzspStatus.HOST_FATAL_ERROR);
+                return;
+            } else {
+                debug(`Error while parsing received frame in NOT_CONNECTED state (flags=${this.flags}), status=${EzspStatus[status]}.`);
+            }
         }
     }
 
@@ -628,26 +625,34 @@ export class UartAsh extends EventEmitter {
      * - EzspStatus.ASH_NCP_FATAL_ERROR)
      */
     public async start(): Promise<EzspStatus> {
-        if (this.closing || (this.flags & Flag.CONNECTED)) {
+        if (!this.portOpen || (this.flags & Flag.CONNECTED)) {
             return EzspStatus.ERROR_INVALID_CALL;
         }
 
         console.log(`======== ASH starting ========`);
 
-        if (this.serialPort != null) {
-            this.serialPort.flush();// clear read/write buffers
-        } else {
-            // XXX: Socket equiv?
+        try {
+            if (this.serialPort != null) {
+                await this.serialPort.asyncFlush();// clear read/write buffers
+            } else {
+                // XXX: Socket equiv?
+            }
+        } catch (err) {
+            console.error(`Error while flushing before start: ${err}`);
         }
 
         this.sendExec();
 
-        // block til RSTACK or timeout
+        // block til RSTACK, fatal error or timeout
+        // NOTE: on average, this seems to take around 1000ms when successful
         for (let i = 0; i < CONFIG_TIME_RST; i += CONFIG_TIME_RST_CHECK) {
             if ((this.flags & Flag.CONNECTED)) {
                 console.log(`======== ASH started ========`);
 
                 return EzspStatus.SUCCESS;
+            } else if ((this.hostError !== EzspStatus.NO_ERROR) || (this.ncpError !== EzspStatus.NO_ERROR)) {
+                // don't wait for inevitable fail, bail early, let retry logic in EZSP layer do its thing
+                break;
             }
 
             debug(`Waiting for RSTACK... ${i}/${CONFIG_TIME_RST}`);
@@ -664,14 +669,24 @@ export class UartAsh extends EventEmitter {
         this.closing = true;
 
         this.printCounters();
+        await this.closePort();
+        this.initVariables();
 
+        console.log(`======== ASH stopped ========`);
+    }
+
+    /**
+     * Close port and remove listeners.
+     * Does nothing if port not defined/open.
+     */
+    public async closePort(): Promise<void> {
         if (this.serialPort?.isOpen) {
             try {
                 await this.serialPort.asyncFlushAndClose();
 
                 debug(`Serial port closed.`);
             } catch (err) {
-                debug(`Failed to close serial port ${err}.`);
+                console.error(`Failed to close serial port ${err}.`);
             }
 
             this.serialPort.removeAllListeners();
@@ -681,9 +696,6 @@ export class UartAsh extends EventEmitter {
 
             debug(`Socket port closed.`);
         }
-
-        this.initVariables();
-        console.log(`======== ASH stopped ========`);
     }
 
     /**
@@ -709,12 +721,16 @@ export class UartAsh extends EventEmitter {
 
         // ask ncp to reset itself using RST frame
         try {
-            await this.initPort();
+            if (!this.portOpen) {
+                await this.initPort();
+            }
 
             this.flags = Flag.RST | Flag.CAN;
 
             return EzspStatus.SUCCESS;
         } catch (err) {
+            console.error(`Failed to init port with error ${err}`);
+
             this.hostError = status;
 
             return EzspStatus.HOST_FATAL_ERROR;
@@ -1030,7 +1046,8 @@ export class UartAsh extends EventEmitter {
         case EzspStatus.ASH_ERROR_XON_XOFF:
             return this.hostDisconnect(status);
         default:
-            throw new Error(`Unhandled error while receiving frame.`);
+            console.error(`Unhandled error while receiving frame, status=${EzspStatus[status]}.`);
+            return this.hostDisconnect(EzspStatus.HOST_FATAL_ERROR);
         }
 
         // Got a complete frame - validate its control and length.
@@ -1392,8 +1409,6 @@ export class UartAsh extends EventEmitter {
 
         console.error(`ASH disconnected: ${EzspStatus[error]} | NCP status: ${EzspStatus[this.ncpError]}`);
         
-        this.emit(AshEvents.hostError, error);
-
         return EzspStatus.HOST_FATAL_ERROR;
     }
 
@@ -1407,8 +1422,6 @@ export class UartAsh extends EventEmitter {
         this.ncpError = error;
 
         console.error(`ASH disconnected | NCP status: ${EzspStatus[this.ncpError]}`);
-
-        this.emit(AshEvents.ncpError, error);
 
         return EzspStatus.ASH_NCP_FATAL_ERROR;
     }

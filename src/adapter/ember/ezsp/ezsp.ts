@@ -290,13 +290,12 @@ export class Ezsp extends EventEmitter {
     constructor(tickInterval: number, options: SerialPortOptions) {
         super();
 
-        this.tickInterval = tickInterval || 60;
+        this.tickInterval = tickInterval || 5;
         this.frameContents = Buffer.alloc(EZSP_MAX_FRAME_LENGTH);
         this.buffalo = new EzspBuffalo(this.frameContents);
 
         this.ash = new UartAsh(options);
-        this.ash.on(AshEvents.hostError, this.onAshHostError.bind(this));
-        this.ash.on(AshEvents.ncpError, this.onAshNCPError.bind(this));
+        this.ash.on(AshEvents.rxError, this.onAshRxError.bind(this));
         this.ash.on(AshEvents.frame, this.onAshFrame.bind(this));
     }
 
@@ -343,6 +342,7 @@ export class Ezsp extends EventEmitter {
         for (let i = 0; i < MAX_INIT_ATTEMPTS; i++) {
             status = await this.ash.resetNcp();
 
+            // fail early if we couldn't even get the port set up
             if (status !== EzspStatus.SUCCESS) {
                 return status;
             }
@@ -386,11 +386,7 @@ export class Ezsp extends EventEmitter {
         return this.ash.connected;
     }
 
-    private onAshHostError(status: EzspStatus): void {
-        this.ezspErrorHandler(status);
-    }
-
-    private onAshNCPError(status: EzspStatus): void {
+    private onAshRxError(status: EzspStatus): void {
         this.ezspErrorHandler(status);
     }
 
@@ -577,7 +573,7 @@ export class Ezsp extends EventEmitter {
             }));
 
             if (status !== EzspStatus.SUCCESS) {
-                throw status;
+                throw new Error(EzspStatus[status]);
             }
         } catch (err) {
             debug(`=x=> ${this.frameToString} Error: ${err}`);
@@ -4554,7 +4550,7 @@ export class Ezsp extends EventEmitter {
                 break;
             }
             default: {
-                console.log(`<=== [ZDO clusterId=${apsFrame.clusterId}] Support not implemented`);
+                console.log(`<=== [ZDO clusterId=${apsFrame.clusterId}] Support not implemented upstream.`);
                 break;
             }
             }
@@ -7535,10 +7531,10 @@ export class Ezsp extends EventEmitter {
         gpdfSecurityLevel: EmberGpSecurityLevel, gpdfSecurityKeyType: EmberGpKeyType, autoCommissioning: boolean, bidirectionalInfo: number,
         gpdSecurityFrameCounter: number, gpdCommandId: number, mic: number, proxyTableIndex: number, gpdCommandPayload: Buffer): void {
         debug(`ezspGpepIncomingMessageHandler(): callback called with: [status=${EmberStatus[status]}], [gpdLink=${gpdLink}], `
-            + `[sequenceNumber=${sequenceNumber}], [addr=${JSON.stringify(addr)}], [gpdfSecurityLevel=${gpdfSecurityLevel}], `
-            + `[gpdfSecurityKeyType=${gpdfSecurityKeyType}], [autoCommissioning=${autoCommissioning}], [bidirectionalInfo=${bidirectionalInfo}], `
-            + `[gpdSecurityFrameCounter=${gpdSecurityFrameCounter}], [gpdCommandId=${gpdCommandId}], [mic=${mic}], `
-            + `[proxyTableIndex=${proxyTableIndex}], [gpdCommandPayload=${gpdCommandPayload.toString('hex')}]`);
+            + `[sequenceNumber=${sequenceNumber}], [addr=${JSON.stringify(addr)}], [gpdfSecurityLevel=${EmberGpSecurityLevel[gpdfSecurityLevel]}], `
+            + `[gpdfSecurityKeyType=${EmberGpKeyType[gpdfSecurityKeyType]}], [autoCommissioning=${autoCommissioning}], `
+            + `[bidirectionalInfo=${bidirectionalInfo}], [gpdSecurityFrameCounter=${gpdSecurityFrameCounter}], [gpdCommandId=${gpdCommandId}], `
+            + `[mic=${mic}], [proxyTableIndex=${proxyTableIndex}], [gpdCommandPayload=${gpdCommandPayload.toString('hex')}]`);
 
         if (addr.applicationId === EmberGpApplicationId.IEEE_ADDRESS) {
             // XXX: don't bother parsing for upstream for now, since it will be rejected

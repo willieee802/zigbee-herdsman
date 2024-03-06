@@ -148,7 +148,6 @@ import {
     GP_ENDPOINT,
     EMBER_ALL_802_15_4_CHANNELS_MASK,
     ZIGBEE_PROFILE_INTEROPERABILITY_LINK_KEY,
-    HA_PROFILE_ID,
 } from "../consts";
 import {EmberRequestQueue} from "./requestQueue";
 import {FIXED_ENDPOINTS} from "./endpoints";
@@ -415,13 +414,13 @@ export class EmberAdapter extends Adapter {
     private readonly ezsp: Ezsp;
     private version: {ezsp: number, revision: string} & EmberVersion;
 
-    private requestQueue: EmberRequestQueue;
-    private oneWaitress: EmberOneWaitress;
+    private readonly requestQueue: EmberRequestQueue;
+    private readonly oneWaitress: EmberOneWaitress;
     /** Periodically retrieve counters then clear them. */
     private watchdogCountersHandle: NodeJS.Timeout;
 
     /** Hold ZDO request in process. */
-    private zdoRequestBuffalo: EzspBuffalo;
+    private readonly zdoRequestBuffalo: EzspBuffalo;
     /** Sequence number used for ZDO requests. static uint8_t  */
     private zdoRequestSequence: number;
     /** Default radius used for broadcast ZDO requests. uint8_t */
@@ -452,13 +451,13 @@ export class EmberAdapter extends Adapter {
         // TODO config
         this.concentratorType = EMBER_HIGH_RAM_CONCENTRATOR;
 
-        // TODO: config dispatch interval, tested at 100, 80, 60
-        this.requestQueue = new EmberRequestQueue(60);
+        const delay = (typeof this.adapterOptions.delay === 'number') ? Math.min(Math.max(this.adapterOptions.delay, 5), 60) : 5;
+
+        this.requestQueue = new EmberRequestQueue(delay);
         this.oneWaitress = new EmberOneWaitress();
         this.zdoRequestBuffalo = new EzspBuffalo(Buffer.alloc(EZSP_MAX_FRAME_LENGTH));
 
-        // TODO: config tick interval, tested at 500, 300, 100, 60, 30, all work fine and only really noticeable with interviews
-        this.ezsp = new Ezsp(60, serialPortOptions);
+        this.ezsp = new Ezsp(delay, serialPortOptions);
 
         this.ezsp.on(EzspEvents.STACK_STATUS, this.onStackStatus.bind(this));
 
@@ -2332,40 +2331,26 @@ export class EmberAdapter extends Adapter {
 
     /**
      * ZDO
-     * @brief Send a request to remove a binding entry with the specified
-     * contents from the specified node.
+     * Common logic used by `emberBindRequest` & `emberUnbindRequest`.
+     * 
+     * @param target 
+     * @param bindClusterId 
+     * @param source 
+     * @param sourceEndpoint 
+     * @param clusterId 
+     * @param type 
+     * @param destination 
+     * @param groupAddress 
+     * @param destinationEndpoint 
+     * @param options 
      *
-     * @param target          The node on which the binding will be removed.
-     * @param source          The source EUI64 in the binding entry.
-     * @param sourceEndpoint  The source endpoint in the binding entry.
-     * @param clusterId       The cluster ID in the binding entry.
-     * @param type            The type of binding, either ::UNICAST_BINDING,
-     *  ::MULTICAST_BINDING, or ::UNICAST_MANY_TO_ONE_BINDING.
-     *  ::UNICAST_MANY_TO_ONE_BINDING is an Ember-specific extension
-     *  and should be used only when the target is an Ember device.
-     * @param destination     The destination EUI64 in the binding entry for the
-     *   ::UNICAST_BINDING or ::UNICAST_MANY_TO_ONE_BINDING.
-     * @param groupAddress    The group address for the ::MULTICAST_BINDING.
-     * @param destinationEndpoint  The destination endpoint in the binding entry for
-     *   the ::UNICAST_BINDING or ::UNICAST_MANY_TO_ONE_BINDING.
-     * @param options         The options to use when sending the request. See
-     * emberSendUnicast() for a description.
-     *
-     * @return An ::EmberStatus value.
+     * @returns An ::EmberStatus value.
      * - ::EMBER_SUCCESS
      * - ::EMBER_NO_BUFFERS
-     * _ ::EMBER_NETWORK_DOWN
+     * - ::EMBER_NETWORK_DOWN
      * - ::EMBER_NETWORK_BUSY
-     * @param target
-     * @param bindClusterId 
-     * @param source
-     * @param sourceEndpoint uint8_t
-     * @param clusterId uint16_t
-     * @param type uint8_t
-     * @param destination
-     * @param groupAddress uint16_t
-     * @param destinationEndpoint uint8_t
-     * @param options
+     * @returns APS frame created for the request
+     * @returns The tag used on the message.
      */
     private async emberSendZigDevBindRequest(target: EmberNodeId, bindClusterId: number, source: EmberEUI64, sourceEndpoint: number,
         clusterId: number, type: number, destination: EmberEUI64, groupAddress: EmberMulticastId, destinationEndpoint: number,
@@ -2413,8 +2398,13 @@ export class EmberAdapter extends Adapter {
      * @param options  The options to use when sending the request. See
      * emberSendUnicast() for a description.
      *
-     * @return An EmberStatus value. ::EMBER_SUCCESS, ::EMBER_NO_BUFFERS,
-     * ::EMBER_NETWORK_DOWN or ::EMBER_NETWORK_BUSY.
+     * @returns An ::EmberStatus value.
+     * - ::EMBER_SUCCESS
+     * - ::EMBER_NO_BUFFERS
+     * - ::EMBER_NETWORK_DOWN
+     * - ::EMBER_NETWORK_BUSY
+     * @returns APS frame created for the request
+     * @returns The tag used on the message.
      */
     private async emberBindRequest(target: EmberNodeId, source: EmberEUI64, sourceEndpoint: number, clusterId: number, type: number,
         destination: EmberEUI64, groupAddress: EmberMulticastId, destinationEndpoint: number, options: EmberApsOption)
@@ -2456,11 +2446,13 @@ export class EmberAdapter extends Adapter {
      * @param options         The options to use when sending the request. See
      * emberSendUnicast() for a description.
      *
-     * @return An ::EmberStatus value.
+     * @returns An ::EmberStatus value.
      * - ::EMBER_SUCCESS
      * - ::EMBER_NO_BUFFERS
-     * _ ::EMBER_NETWORK_DOWN
+     * - ::EMBER_NETWORK_DOWN
      * - ::EMBER_NETWORK_BUSY
+     * @returns APS frame created for the request
+     * @returns The tag used on the message.
      */
     private async emberUnbindRequest(target: EmberNodeId, source: EmberEUI64, sourceEndpoint: number, clusterId: number, type: number,
         destination: EmberEUI64, groupAddress: EmberMulticastId, destinationEndpoint: number, options: EmberApsOption)
@@ -2940,22 +2932,13 @@ export class EmberAdapter extends Adapter {
             throw new Error(`[ADD INSTALL CODE] Failed for "${ieeeAddress}"; no code given.`);
         }
 
-        let validInstallCodeSize = false;
-
-        for (const validCodeSize of EMBER_INSTALL_CODE_SIZES) {
-            if (key.length === validCodeSize) {
-                validInstallCodeSize = true;
-                break;
-            }
-        }
-
-        if (!validInstallCodeSize) {
+        if (EMBER_INSTALL_CODE_SIZES.indexOf(key.length) === -1) {
             throw new Error(`[ADD INSTALL CODE] Failed for "${ieeeAddress}"; invalid code size.`);
         }
 
-        // Reverse the bits in a byte
+        // Reverse the bits in a byte (uint8_t)
         const reverse = (b: number): number => {
-            return ((b * 0x0802 & 0x22110) | (b * 0x8020 & 0x88440)) * 0x10101 >> 16;
+            return (((b * 0x0802 & 0x22110) | (b * 0x8020 & 0x88440)) * 0x10101 >> 16) & 0xFF;
         };
         let crc = 0xFFFF;// uint16_t
 
@@ -2965,7 +2948,7 @@ export class EmberAdapter extends Adapter {
             crc = halCommonCrc16(reverse(key[index]), crc);
         }
 
-        crc = ~highLowToInt(reverse(lowByte(crc)), reverse(highByte(crc)));
+        crc = (~highLowToInt(reverse(lowByte(crc)), reverse(highByte(crc)))) & 0xFFFF;
 
         if (key[key.length - EMBER_INSTALL_CODE_CRC_SIZE] !== lowByte(crc) || key[key.length - EMBER_INSTALL_CODE_CRC_SIZE + 1] !== highByte(crc)) {
             throw new Error(`[ADD INSTALL CODE] Failed for "${ieeeAddress}"; invalid code CRC.`);
@@ -3004,19 +2987,21 @@ export class EmberAdapter extends Adapter {
     /** WARNING: Adapter impl. Starts timer immediately upon returning */
     public waitFor(networkAddress: number, endpoint: number, frameType: FrameType, direction: Direction, transactionSequenceNumber: number,
         clusterID: number, commandIdentifier: number, timeout: number): {promise: Promise<ZclDataPayload>; cancel: () => void;} {
+        const sourceEndpointInfo = FIXED_ENDPOINTS[0];
         const waiter = this.oneWaitress.waitFor<ZclDataPayload>({
             target: networkAddress,
             apsFrame: {
                 clusterId: clusterID,
-                profileId: HA_PROFILE_ID,// XXX: ok? only used by OTA upstream
+                profileId: sourceEndpointInfo.profileId,// XXX: only used by OTA upstream
                 sequence: 0,// set by stack
-                sourceEndpoint: endpoint,
-                destinationEndpoint: 0,
+                sourceEndpoint: sourceEndpointInfo.endpoint,
+                destinationEndpoint: endpoint,
                 groupId: 0,
                 options: EmberApsOption.NONE,
             },
             zclSequence: transactionSequenceNumber,
-        }, timeout || DEFAULT_ZCL_REQUEST_TIMEOUT * 3);// XXX: since this is used by OTA..?
+            commandIdentifier,
+        }, timeout || DEFAULT_ZCL_REQUEST_TIMEOUT * 3);// XXX: since this is used by OTA...
 
         return {
             cancel: (): void => this.oneWaitress.remove(waiter.id),
@@ -3661,6 +3646,7 @@ export class EmberAdapter extends Adapter {
                             target: networkAddress,
                             apsFrame,
                             zclSequence: zclFrame.Header.transactionSequenceNumber,
+                            commandIdentifier: commandResponseId,
                         }, timeout || DEFAULT_ZCL_REQUEST_TIMEOUT));
 
                         resolve(result);
@@ -3912,6 +3898,7 @@ export class EmberAdapter extends Adapter {
                         target: null,
                         apsFrame: apsFrame,
                         zclSequence: zclFrame.Header.transactionSequenceNumber,
+                        commandIdentifier: command.response,
                     }, timeout || DEFAULT_ZCL_REQUEST_TIMEOUT * 2));// XXX: touchlink timeout?
 
                     resolve(result);
