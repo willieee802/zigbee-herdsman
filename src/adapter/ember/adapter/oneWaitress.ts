@@ -1,10 +1,21 @@
 /* istanbul ignore file */
 import equals from 'fast-deep-equal/es6';
-import {ZclDataPayload} from "../../events";
+import {ZclPayload} from "../../events";
 import {TOUCHLINK_PROFILE_ID} from "../consts";
 import {EmberApsFrame, EmberNodeId} from "../types";
 import {EmberZdoStatus} from "../zdo";
+import {logger} from '../../../utils/logger';
 
+const NS = 'zh:ember:waitress';
+
+/** Events specific to OneWaitress usage. */
+export enum OneWaitressEvents {
+    STACK_STATUS_NETWORK_UP = 'STACK_STATUS_NETWORK_UP',
+    STACK_STATUS_NETWORK_DOWN = 'STACK_STATUS_NETWORK_DOWN',
+    STACK_STATUS_NETWORK_OPENED = 'STACK_STATUS_NETWORK_OPENED',
+    STACK_STATUS_NETWORK_CLOSED = 'STACK_STATUS_NETWORK_CLOSED',
+    STACK_STATUS_CHANNEL_CHANGED = 'STACK_STATUS_CHANNEL_CHANGED',
+};
 
 type OneWaitressMatcher = {
     /**
@@ -121,7 +132,7 @@ export class EmberOneWaitress {
                 } else if (status === EmberZdoStatus.ZDP_NO_ENTRY) {
                     // XXX: bypassing fail here since Z2M seems to trigger ZDO remove-type commands without checking current state
                     //      Z2M also fails with ZCL payload NOT_FOUND though. This should be removed once upstream fixes that.
-                    console.log(`[ZDO] Received status ZDP_NO_ENTRY for "${sender}" cluster "${apsFrame.clusterId}". Ignoring.`);
+                    logger.info(`[ZDO] Received status ZDP_NO_ENTRY for "${sender}" cluster "${apsFrame.clusterId}". Ignoring.`, NS);
                     waiter.resolve(payload);
                 } else {
                     waiter.reject(new Error(`[ZDO] Failed response by NCP for "${sender}" cluster "${apsFrame.clusterId}" `
@@ -135,7 +146,9 @@ export class EmberOneWaitress {
         return false;
     }
 
-    public resolveZCL(payload: ZclDataPayload): boolean {
+    public resolveZCL(payload: ZclPayload): boolean {
+        if (!payload.header) return false;
+
         for (const [index, waiter] of this.waiters.entries()) {
             if (waiter.timedout) {
                 this.waiters.delete(index);
@@ -144,9 +157,9 @@ export class EmberOneWaitress {
 
             // no target in touchlink, also no APS sequence, but use the ZCL one instead
             if (((waiter.matcher.apsFrame.profileId === TOUCHLINK_PROFILE_ID) || (payload.address === waiter.matcher.target))
-                && (!waiter.matcher.zclSequence || (payload.frame.Header.transactionSequenceNumber === waiter.matcher.zclSequence))
-                && (!waiter.matcher.commandIdentifier || (payload.frame.Header.commandIdentifier === waiter.matcher.commandIdentifier))
-                && (payload.frame.Cluster.ID === waiter.matcher.apsFrame.clusterId)
+                && (!waiter.matcher.zclSequence || (payload.header.transactionSequenceNumber === waiter.matcher.zclSequence))
+                && (!waiter.matcher.commandIdentifier || (payload.header.commandIdentifier === waiter.matcher.commandIdentifier))
+                && (payload.clusterID === waiter.matcher.apsFrame.clusterId)
                 && (payload.endpoint === waiter.matcher.apsFrame.destinationEndpoint)) {
                 clearTimeout(waiter.timer);
 

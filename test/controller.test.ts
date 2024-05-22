@@ -5,9 +5,8 @@ import {DeconzAdapter} from '../src/adapter/deconz/adapter';
 import {ZiGateAdapter} from "../src/adapter/zigate/adapter";
 import equals from 'fast-deep-equal/es6';
 import fs from 'fs';
-import { ZclFrame } from "../src/zcl";
 import { Device, Group} from "../src/controller/model";
-import * as Zcl from '../src/zcl';
+import * as Zcl from '../src/zspec/zcl';
 import zclTransactionSequenceNumber from '../src/controller/helpers/zclTransactionSequenceNumber';
 import Request from '../src/controller/helpers/request';
 import {Adapter} from '../src/adapter';
@@ -15,11 +14,19 @@ import path  from 'path';
 import {Wait} from '../src/utils';
 import * as Models from "../src/models";
 import * as Utils from "../src/utils";
-import { isTypedArray } from "util/types";
 import Bonjour, {BrowserConfig, Service} from 'bonjour-service';
-import {LoggerStub} from "../src/controller/logger-stub";
+import {setLogger} from "../src/utils/logger";
+import {BroadcastAddress} from "../src/zspec/enums";
+import ZclTransactionSequenceNumber from "../src/controller/helpers/zclTransactionSequenceNumber";
 const globalSetImmediate = setImmediate;
 const flushPromises = () => new Promise(globalSetImmediate);
+
+const mockLogger = {
+    debug: jest.fn(),
+    info: jest.fn(),
+    warning: jest.fn(),
+    error: jest.fn(),
+};
 
 let skipWait = true;
 Wait.mockImplementation((milliseconds) => {
@@ -47,8 +54,10 @@ const mockAdapterReset = jest.fn();
 const mockAdapterStop = jest.fn();
 const mockAdapterStart = jest.fn().mockReturnValue('resumed');
 const mockAdapterSetTransmitPower = jest.fn();
+const mockAdapterSupportsChangeChannel = jest.fn().mockReturnValue(false);
+const mockAdapterChangeChannel = jest.fn();
 const mockAdapterGetCoordinator = jest.fn().mockReturnValue({
-    ieeeAddr: '0x123',
+    ieeeAddr: '0x0000012300000000',
     networkAddress: 123,
     manufacturerID: 100,
     endpoints: [
@@ -72,76 +81,98 @@ let configureReportStatus = 0;
 let configureReportDefaultRsp = false;
 
 const restoreMocksendZclFrameToEndpoint = () => {
-    mocksendZclFrameToEndpoint.mockImplementation((ieeeAddr, networkAddress, endpoint, frame: ZclFrame) => {
-        if (frame.isGlobal() && frame.isCommand('read') && (frame.isCluster('genBasic') || frame.isCluster('ssIasZone') || frame.isCluster('genPollCtrl') || frame.isCluster('hvacThermostat'))) {
+    mocksendZclFrameToEndpoint.mockImplementation((ieeeAddr, networkAddress, endpoint, frame: Zcl.Frame) => {
+        if (frame.header.isGlobal && frame.isCommand('read') && (frame.isCluster('genBasic') || frame.isCluster('ssIasZone') || frame.isCluster('genPollCtrl') || frame.isCluster('hvacThermostat'))) {
             const payload = [];
-            const cluster = frame.Cluster;
-            for (const item of frame.Payload) {
+            const cluster = frame.cluster;
+            for (const item of frame.payload) {
+                if (item.attrId !== 65314) {
+                const attribute = cluster.getAttribute(item.attrId);
                 if (frame.isCluster('ssIasZone') && item.attrId === 0) {
                     iasZoneReadState170Count++;
-                    payload.push({attrId: item.attrId, attrData: iasZoneReadState170Count === 2 && enroll170 ? 1 : 0, status: 0});
-                } else if (item.attrId !== 65314) {
-                    const attribute = cluster.getAttribute(item.attrId).name;
-                    payload.push({attrId: item.attrId, attrData: mockDevices[networkAddress].attributes[endpoint][attribute], status: 0})
+                    payload.push({attrId: item.attrId, dataType: attribute.type, attrData: iasZoneReadState170Count === 2 && enroll170 ? 1 : 0, status: 0});
+                    } else {
+                    payload.push({attrId: item.attrId, dataType: attribute.type, attrData: mockDevices[networkAddress].attributes[endpoint][attribute.name], status: 0})
+                    }
                 }
             }
 
-            // @ts-ignore
-            return {frame: new ZclFrame(null, payload, frame.Cluster)};
+            const responseFrame = mockZclFrame.create(0, 1, true, null, 10, 'readRsp', frame.cluster.ID, payload);
+            return {clusterID: responseFrame.cluster.ID, header: responseFrame.header, data: responseFrame.toBuffer()};
         }
 
-        if (frame.isSpecific() && (frame.isCommand('add') || frame.isCommand('remove')) && frame.isCluster('genGroups')) {
-            // @ts-ignore
-            return {frame: new ZclFrame(null, {status: 0, groupid: 1}, frame.Cluster)};
+        if (frame.header.isSpecific && (frame.isCommand('add') || frame.isCommand('remove')) && frame.isCluster('genGroups')) {
+            const responseFrame = mockZclFrame.create(1, 1, true, null, 10, frame.command.name + 'Rsp', frame.cluster.ID, {status: 0, groupid: 1});
+            return {clusterID: frame.cluster.ID, header: responseFrame.header, data: responseFrame.toBuffer()};
         }
 
-        if (networkAddress === 170 && frame.isGlobal() && frame.isCluster('ssIasZone') && frame.isCommand('write') && frame.Payload[0].attrId === 16) {
+        if (networkAddress === 170 && frame.header.isGlobal && frame.isCluster('ssIasZone') && frame.isCommand('write') && frame.payload[0].attrId === 16) {
             // Write of ias cie address
-            const response = Zcl.ZclFrame.create(
+            const response = Zcl.Frame.create(
                 Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, false,
                 null, 1, 'enrollReq', Zcl.Utils.getCluster('ssIasZone').ID,
                 {zonetype: 0, manucode: 1}
             );
 
-            mockAdapterEvents['zclData']({
+            mockAdapterEvents['zclPayload']({
                 wasBroadcast: false,
                 address: 170,
-                frame: response,
+                clusterID: response.cluster.ID,
+                data: response.toBuffer(),
+                header: response.header,
                 endpoint: 1,
                 linkquality: 50,
                 groupID: 1,
             });
         }
 
-        if (frame.isGlobal() && frame.isCommand('write')) {
+        if (frame.header.isGlobal && frame.isCommand('write')) {
             const payload = [];
-            for (const item of frame.Payload) {
+            for (const item of frame.payload) {
                 payload.push({attrId: item.attrId, status: 0})
             }
 
-            // @ts-ignore
-            return {frame: new ZclFrame(null, payload, frame.Cluster)};
+            const responseFrame = mockZclFrame.create(0, 1, true, null, 10, 'writeRsp', 0, payload);
+            return {clusterID: responseFrame.cluster.ID, header: responseFrame.header, data: responseFrame.toBuffer()};
         }
 
-        if (frame.isGlobal() && frame.isCommand('configReport')) {
+        if (frame.header.isGlobal && frame.isCommand('configReport')) {
             let payload;
+            let cmd;
             if (configureReportDefaultRsp) {
                 payload = {cmdId: 1, statusCode: configureReportStatus}
+                cmd = 'defaultRsp';
             } else {
                 payload = [];
-                for (const item of frame.Payload) {
+                cmd = 'configReportRsp';
+                for (const item of frame.payload) {
                     payload.push({attrId: item.attrId, status: configureReportStatus, direction: 1})
                 }
-    
-                
             }
-            // @ts-ignore
-            return {frame: new ZclFrame(null, payload, frame.Cluster)};
+
+            const responseFrame = mockZclFrame.create(0, 1, true, null, 10, cmd, 0, payload);
+            return {clusterID: responseFrame.cluster.ID, header: responseFrame.header, data: responseFrame.toBuffer()};
         }
     })
 }
 
-const mocksClear = [mocksendZclFrameToEndpoint, mockAdapterReset, mocksendZclFrameToGroup, mockSetChannelInterPAN, mocksendZclFrameInterPANToIeeeAddr, mocksendZclFrameInterPANBroadcast, mockRestoreChannelInterPAN, mockAddInstallCode];
+const mocksClear = [
+    mockAdapterStart,
+    mocksendZclFrameToEndpoint,
+    mockAdapterReset,
+    mocksendZclFrameToGroup,
+    mockSetChannelInterPAN,
+    mocksendZclFrameInterPANToIeeeAddr,
+    mocksendZclFrameInterPANBroadcast,
+    mockRestoreChannelInterPAN,
+    mockAddInstallCode,
+    mockAdapterGetNetworkParameters,
+    mockAdapterChangeChannel,
+    mockLogger.debug,
+    mockLogger.info,
+    mockLogger.warning,
+    mockLogger.error,
+];
 const deepClone = (obj) => JSON.parse(JSON.stringify(obj));
 
 const equalsPartial = (object, expected) => {
@@ -203,7 +234,7 @@ const mockDevices = {
         activeEndpoints: {endpoints: [1]},
         simpleDescriptor: {1: {endpointID: 1, deviceID: 5, inputClusters: [0, 1280], outputClusters: [2], profileID: 99}},
         attributes: {
-            1: {zoneState: 0, iasCieAddr: '0x123', modelId: 'myIasDevice', manufacturerName: 'KoenAndCoSecurity', zclVersion: 1, appVersion: 2, hwVersion: 3, dateCode: '201901', swBuildId: '1.01', powerSource: 1, stackVersion: 101},
+            1: {zoneState: 0, iasCieAddr: '0x0000012300000000', modelId: 'myIasDevice', manufacturerName: 'KoenAndCoSecurity', zclVersion: 1, appVersion: 2, hwVersion: 3, dateCode: '201901', swBuildId: '1.01', powerSource: 1, stackVersion: 101},
         },
     },
     171: {
@@ -269,7 +300,7 @@ const mockDevices = {
     },
 }
 
-const mockZclFrame = ZclFrame;
+const mockZclFrame = Zcl.Frame;
 
 // Mock realPathSync
 jest.mock('../src/utils/realpathSync', () => {
@@ -346,13 +377,18 @@ jest.mock('../src/adapter/z-stack/adapter/zStackAdapter', () => {
             getNetworkParameters: mockAdapterGetNetworkParameters,
             waitFor: mockAdapterWaitFor,
             setTransmitPower: mockAdapterSetTransmitPower,
+            supportsChangeChannel: mockAdapterSupportsChangeChannel,
+            changeChannel: mockAdapterChangeChannel,
             nodeDescriptor: async (networkAddress) => {
                 const descriptor = mockDevices[networkAddress].nodeDescriptor;
                 if (typeof descriptor === 'string' && descriptor.startsWith('xiaomi')) {
-                    await mockAdapterEvents['zclData']({
+                    const frame = mockZclFrame.create(0, 1, true, null, 10, 'readRsp', 0, [{attrId: 5, status: 0, dataType: 66, attrData: 'lumi.occupancy'}]);
+                    await mockAdapterEvents['zclPayload']({
                         wasBroadcast: false,
                         address: networkAddress,
-                        frame: mockZclFrame.create(0, 1, true, null, 10, 'readRsp', 0, [{attrId: 5, status: 0, dataType: 66, attrData: 'lumi.occupancy'}]),
+                        clusterID: frame.cluster.ID,
+                        data: frame.toBuffer(),
+                        header: frame.header,
                         endpoint: 1,
                         linkquality: 50,
                         groupID: 1,
@@ -460,7 +496,7 @@ ZiGateAdapter.isValidPath = mockZiGateAdapterIsValidPath;
 ZiGateAdapter.autoDetectPath = mockZiGateAdapterAutoDetectPath;
 
 const mocksRestore = [
-    mockAdapterStart, mockAdapterPermitJoin, mockAdapterStop, mockAdapterRemoveDevice, mocksendZclFrameToAll,
+    mockAdapterPermitJoin, mockAdapterStop, mockAdapterRemoveDevice, mocksendZclFrameToAll,
     mockZStackAdapterIsValidPath, mockZStackAdapterAutoDetectPath,
     mockDeconzAdapterIsValidPath, mockDeconzAdapterAutoDetectPath,
     mockZiGateAdapterIsValidPath, mockZiGateAdapterAutoDetectPath,
@@ -474,6 +510,7 @@ const events = {
     deviceLeave: [],
     message: [],
     permitJoinChanged: [],
+    lastSeenChanged: [],
 }
 
 const backupPath = getTempFile('backup');
@@ -498,12 +535,13 @@ const options = {
 const databaseContents = () => fs.readFileSync(options.databasePath).toString();
 
 describe('Controller', () => {
-    let controller;
+    let controller: Controller;
 
     beforeAll(async () => {
         jest.useFakeTimers({doNotFake: ['setTimeout']});
         Date.now = jest.fn()
         Date.now.mockReturnValue(150);
+        setLogger(mockLogger);
         dummyBackup = await Utils.BackupUtils.toUnifiedBackup(mockDummyBackup);
     });
 
@@ -512,6 +550,8 @@ describe('Controller', () => {
     });
 
     beforeEach(async () => {
+        mocksRestore.forEach((m) => m.mockRestore());
+        mocksClear.forEach((m) => m.mockClear());
         // @ts-ignore
         mockDevices[174].attributes[1].checkinInterval = default174CheckinInterval;
         zclTransactionSequenceNumber.number = 1;
@@ -534,14 +574,13 @@ describe('Controller', () => {
         controller.on('deviceAnnounce', (device) => events.deviceAnnounce.push(device));
         controller.on('deviceLeave', (device) => events.deviceLeave.push(device));
         controller.on('message', (message) => events.message.push(message));
-        mocksRestore.forEach((m) => m.mockRestore());
-        mocksClear.forEach((m) => m.mockClear());
+        controller.on('lastSeenChanged', (device) => events.lastSeenChanged.push(device));
         restoreMocksendZclFrameToEndpoint();
     });
 
     it('Call controller constructor options mixed with default options', async () => {
         await controller.start();
-        expect(ZStackAdapter).toBeCalledWith({"networkKeyDistribute":false,"networkKey":[1,3,5,7,9,11,13,15,0,2,4,6,8,10,12,13],"panID":6755,"extendedPanID":[221,221,221,221,221,221,221,221],"channelList":[15]}, {"baudRate": 115200, "path": "/dummy/conbee", "rtscts": true, "adapter": null}, backupPath, {"disableLED": false}, undefined);
+        expect(ZStackAdapter).toHaveBeenCalledWith({"networkKeyDistribute":false,"networkKey":[1,3,5,7,9,11,13,15,0,2,4,6,8,10,12,13],"panID":6755,"extendedPanID":[221,221,221,221,221,221,221,221],"channelList":[15]}, {"baudRate": 115200, "path": "/dummy/conbee", "rtscts": true, "adapter": null}, backupPath, {"disableLED": false});
     });
 
     it('Call controller constructor error on invalid channel', async () => {
@@ -581,22 +620,31 @@ describe('Controller', () => {
     });
 
     it('Controller stop, should create backup', async () => {
+        // @ts-expect-error private
+        const databaseSaveSpy = jest.spyOn(controller, 'databaseSave');
         await controller.start();
+        // @ts-expect-error private
+        databaseSaveSpy.mockClear();
         if (fs.existsSync(options.backupPath)) fs.unlinkSync(options.backupPath);
         expect(controller.isStopping()).toBeFalsy();
+        expect(controller.isAdapterDisconnected()).toBeFalsy();
         await controller.stop();
-        expect(mockAdapterPermitJoin).toBeCalledWith(0, null);
+        expect(controller.isStopping()).toBeTruthy();
+        expect(controller.isAdapterDisconnected()).toBeTruthy();
+        expect(mockAdapterPermitJoin).toHaveBeenCalledWith(0, null);
         expect(JSON.parse(fs.readFileSync(options.backupPath).toString())).toStrictEqual(JSON.parse(JSON.stringify(dummyBackup)));
-        expect(mockAdapterStop).toBeCalledTimes(1);
+        expect(mockAdapterStop).toHaveBeenCalledTimes(1);
+        expect(databaseSaveSpy).toHaveBeenCalledTimes(1);
     });
 
     it('Controller start', async () => {
         await controller.start();
-        expect(mockAdapterStart).toBeCalledTimes(1);
+        expect(mockAdapterStart).toHaveBeenCalledTimes(1);
         expect(deepClone(controller.getDevicesByType('Coordinator')[0])).toStrictEqual({
             ID: 1,
             "_events":{},"_eventsCount":0,
             _pendingRequestTimeout: 0,
+            _customClusters: {},
                 _endpoints:
                  [ { deviceID: 3,
                     "_events":{},"_eventsCount":0,
@@ -604,13 +652,13 @@ describe('Controller', () => {
                      outputClusters: [11],
                      pendingRequests: {
                         ID: 1,
-                        deviceIeeeAddress: "0x123",
+                        deviceIeeeAddress: "0x0000012300000000",
                         sendInProgress: false},
                      profileID: 2,
                      ID: 1,
                      meta: {},
                      clusters: {},
-                     deviceIeeeAddress: '0x123',
+                     deviceIeeeAddress: '0x0000012300000000',
                      deviceNetworkAddress: 123,
                      _binds: [],
                      _configuredReportings: [] },
@@ -620,22 +668,21 @@ describe('Controller', () => {
                      outputClusters: [0],
                      pendingRequests: {
                         ID: 2,
-                        deviceIeeeAddress: "0x123",
+                        deviceIeeeAddress: "0x0000012300000000",
                         sendInProgress: false},
                      profileID: 3,
                      meta: {},
                      ID: 2,
                      clusters: {},
-                     deviceIeeeAddress: '0x123',
+                     deviceIeeeAddress: '0x0000012300000000',
                      deviceNetworkAddress: 123,
                      _binds: [],
                      _configuredReportings: [] } ],
-                _ieeeAddr: '0x123',
+                _ieeeAddr: '0x0000012300000000',
                 _interviewCompleted: true,
                 _interviewing: false,
                 _lastSeen: null,
                 _skipDefaultResponse: false,
-                _skipTimeResponse: false,
                 _manufacturerID: 100,
                 _networkAddress: 123,
                 _type: 'Coordinator',
@@ -647,7 +694,7 @@ describe('Controller', () => {
 
     it('Controller update ieeeAddr if changed', async () => {
         await controller.start();
-        expect(controller.getDevicesByType('Coordinator')[0].ieeeAddr).toStrictEqual("0x123");
+        expect(controller.getDevicesByType('Coordinator')[0].ieeeAddr).toStrictEqual("0x0000012300000000");
         await controller.stop();
         mockAdapterGetCoordinator.mockReturnValueOnce({
             ieeeAddr: '0x123444',
@@ -670,7 +717,7 @@ describe('Controller', () => {
             if (counter === 1) {
                 throw new Error('no response')
             } else if (counter === 2) {
-                return {address: '0x123'};
+                return {address: '0x0000012300000000'};
             }
         });
         const result = await controller.touchlinkFactoryResetFirst();
@@ -680,12 +727,12 @@ describe('Controller', () => {
         expect(mockSetChannelInterPAN).toHaveBeenCalledWith(11);
         expect(mockSetChannelInterPAN).toHaveBeenCalledWith(15);
         expect(mocksendZclFrameInterPANBroadcast).toHaveBeenCalledTimes(2);
-        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[0][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"Payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
-        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[1][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"Payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
+        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[0][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
+        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[1][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
         expect(mockRestoreChannelInterPAN).toHaveBeenCalledTimes(1);
         expect(mocksendZclFrameInterPANToIeeeAddr).toHaveBeenCalledTimes(2);
-        expect(deepClone(mocksendZclFrameInterPANToIeeeAddr.mock.calls[0][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":6},"Payload":{"transactionID":expect.any(Number),"duration":65535},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"}});
-        expect(deepClone(mocksendZclFrameInterPANToIeeeAddr.mock.calls[1][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":7},"Payload":{"transactionID":expect.any(Number)},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}});
+        expect(deepClone(mocksendZclFrameInterPANToIeeeAddr.mock.calls[0][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":6},"payload":{"transactionID":expect.any(Number),"duration":65535},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"}});
+        expect(deepClone(mocksendZclFrameInterPANToIeeeAddr.mock.calls[1][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":7},"payload":{"transactionID":expect.any(Number)},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}});
     });
 
     it('Touchlink scan', async () => {
@@ -696,18 +743,18 @@ describe('Controller', () => {
             if (counter === 1) {
                 throw new Error('no response')
             } else if (counter === 2) {
-                return {address: '0x123'};
+                return {address: '0x0000012300000000'};
             }
         });
         const result = await controller.touchlinkScan();
-        expect(result).toStrictEqual([{ieeeAddr: '0x123', channel: 15}]);
+        expect(result).toStrictEqual([{ieeeAddr: '0x0000012300000000', channel: 15}]);
 
         expect(mockSetChannelInterPAN).toHaveBeenCalledTimes(16);
         expect(mockSetChannelInterPAN).toHaveBeenCalledWith(11);
         expect(mockSetChannelInterPAN).toHaveBeenCalledWith(15);
         expect(mocksendZclFrameInterPANBroadcast).toHaveBeenCalledTimes(16);
-        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[0][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"Payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
-        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[1][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"Payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
+        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[0][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
+        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[1][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
         expect(mockRestoreChannelInterPAN).toHaveBeenCalledTimes(1);
         expect(mocksendZclFrameInterPANToIeeeAddr).toHaveBeenCalledTimes(0);
     });
@@ -732,47 +779,51 @@ describe('Controller', () => {
     it('Touchlink factory reset', async () => {
         await controller.start();
         mocksendZclFrameInterPANBroadcast.mockImplementation(() => {
-            return {address: '0x123'};
+            return {address: '0x0000012300000000'};
         });
-        await controller.touchlinkFactoryReset('0x123', 15);
+        await controller.touchlinkFactoryReset('0x0000012300000000', 15);
 
         expect(mockSetChannelInterPAN).toHaveBeenCalledTimes(1);
         expect(mockSetChannelInterPAN).toHaveBeenCalledWith(15);
         expect(mocksendZclFrameInterPANBroadcast).toHaveBeenCalledTimes(1);
-        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[0][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"Payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
+        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[0][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
         expect(mockRestoreChannelInterPAN).toHaveBeenCalledTimes(1);
         expect(mocksendZclFrameInterPANToIeeeAddr).toHaveBeenCalledTimes(2);
-        expect(deepClone(mocksendZclFrameInterPANToIeeeAddr.mock.calls[0][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":6},"Payload":{"transactionID":expect.any(Number),"duration":65535},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"}});
-        expect(deepClone(mocksendZclFrameInterPANToIeeeAddr.mock.calls[1][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":7},"Payload":{"transactionID":expect.any(Number)},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}});
+        expect(deepClone(mocksendZclFrameInterPANToIeeeAddr.mock.calls[0][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":6},"payload":{"transactionID":expect.any(Number),"duration":65535},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"}});
+        expect(deepClone(mocksendZclFrameInterPANToIeeeAddr.mock.calls[1][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":7},"payload":{"transactionID":expect.any(Number)},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}});
     });
 
     it('Touchlink identify', async () => {
         await controller.start();
         mocksendZclFrameInterPANBroadcast.mockImplementation(() => {
-            return {address: '0x123'};
+            return {address: '0x0000012300000000'};
         });
-        await controller.touchlinkIdentify('0x123', 15);
+        await controller.touchlinkIdentify('0x0000012300000000', 15);
 
         expect(mockSetChannelInterPAN).toHaveBeenCalledTimes(1);
         expect(mockSetChannelInterPAN).toHaveBeenCalledWith(15);
         expect(mocksendZclFrameInterPANBroadcast).toHaveBeenCalledTimes(1);
-        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[0][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"Payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
+        expect(deepClone(mocksendZclFrameInterPANBroadcast.mock.calls[0][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":0},"payload":{"transactionID":expect.any(Number),"zigbeeInformation":4,"touchlinkInformation":18},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"}});
         expect(mockRestoreChannelInterPAN).toHaveBeenCalledTimes(1);
         expect(mocksendZclFrameInterPANToIeeeAddr).toHaveBeenCalledTimes(1);
-        expect(deepClone(mocksendZclFrameInterPANToIeeeAddr.mock.calls[0][0])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":6},"Payload":{"transactionID":expect.any(Number),"duration":65535},"Cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"Command":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"}});
+        expect(deepClone(mocksendZclFrameInterPANToIeeeAddr.mock.calls[0][0])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":0,"manufacturerCode":null,"commandIdentifier":6},"payload":{"transactionID":expect.any(Number),"duration":65535},"cluster":{"ID":4096,"attributes":{},"name":"touchlink","commands":{"scanRequest":{"ID":0,"response":1,"parameters":[{"name":"transactionID","type":35},{"name":"zigbeeInformation","type":24},{"name":"touchlinkInformation","type":24}],"name":"scanRequest"},"identifyRequest":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"},"resetToFactoryNew":{"ID":7,"parameters":[{"name":"transactionID","type":35}],"name":"resetToFactoryNew"}},"commandsResponse":{"scanResponse":{"ID":1,"parameters":[{"name":"transactionID","type":35},{"name":"rssiCorrection","type":32},{"name":"zigbeeInformation","type":32},{"name":"touchlinkInformation","type":32},{"name":"keyBitmask","type":33},{"name":"responseID","type":35},{"name":"extendedPanID","type":240},{"name":"networkUpdateID","type":32},{"name":"logicalChannel","type":32},{"name":"panID","type":33},{"name":"networkAddress","type":33},{"name":"numberOfSubDevices","type":32},{"name":"totalGroupIdentifiers","type":32}],"name":"scanResponse"}}},"command":{"ID":6,"parameters":[{"name":"transactionID","type":35},{"name":"duration","type":33}],"name":"identifyRequest"}});
     });
 
     it('Controller should ignore touchlink messages', async () => {
+        const frame = Zcl.Frame.create(
+            Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, false,
+            null, 1, 'scanResponse', Zcl.Utils.getCluster('touchlink').ID,
+            {transactionID: 1, rssiCorrection: 1, zigbeeInformation: 1, touchlinkInformation: 1, keyBitmask: 1, responseID: 1, extendedPanID: '0x001788010de23e6e', networkUpdateID: 1, logicalChannel: 1, panID: 1, networkAddress: 1, numberOfSubDevices: 1, totalGroupIdentifiers: 1}
+        );
+
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             networkAddress: 129,
-            frame: Zcl.ZclFrame.create(
-                Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, false,
-                null, 1, 'scanResponse', Zcl.Utils.getCluster('touchlink').ID,
-                {}
-            ),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
@@ -782,19 +833,60 @@ describe('Controller', () => {
     });
 
     it('Device should update properties when reported', async () => {
+        const frame = mockZclFrame.create(0, 1, true, null, 10, 'readRsp', 0, [{attrId: 5, status: 0, dataType: 66, attrData: 'new.model.id'}]);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         expect(Device.byIeeeAddr('0x129').modelID).toBe('myModelID');
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: mockZclFrame.create(0, 1, true, null, 10, 'readRsp', 0, [{attrId: 5, status: 0, dataType: 66, attrData: 'new.model.id'}]),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
         });
 
         expect(Device.byIeeeAddr('0x129').modelID).toBe('new.model.id');
+    });
+
+    it ('Change channel', async () => {
+        await controller.start();
+        controller.options.network.channelList[0] = 20;
+        await controller.changeChannel();
+        expect(mockAdapterChangeChannel).toHaveBeenCalledWith(20);
+        mockAdapterGetNetworkParameters.mockReturnValueOnce({panID: 1, extendedPanID: 3, channel: 20});
+        expect(await controller.getNetworkParameters()).toEqual({panID: 1, channel: 20, extendedPanID: 3});
+    });
+
+    it ('Change channel on start if supported', async () => {
+        mockAdapterStart.mockReturnValueOnce('resumed');
+        mockAdapterSupportsChangeChannel.mockReturnValueOnce(true);
+        mockAdapterGetNetworkParameters.mockReturnValueOnce({panID: 1, extendedPanID: 3, channel: 25});
+        await controller.start();
+        expect(mockAdapterGetNetworkParameters).toHaveBeenCalledTimes(1);
+        expect(mockAdapterChangeChannel).toHaveBeenCalledWith(15);
+        expect(await controller.getNetworkParameters()).toEqual({panID: 1, channel: 15, extendedPanID: 3});
+    });
+
+    it ('Does not change channel on start if not changed', async () => {
+        mockAdapterStart.mockReturnValueOnce('resumed');
+        mockAdapterSupportsChangeChannel.mockReturnValueOnce(true);
+        await controller.start();
+        expect(mockAdapterGetNetworkParameters).toHaveBeenCalledTimes(1);
+        expect(mockAdapterChangeChannel).toHaveBeenCalledTimes(0);
+    });
+
+    it ('Does not change channel on start if not supported', async () => {
+        mockAdapterStart.mockReturnValueOnce('resumed');
+        mockAdapterSupportsChangeChannel.mockReturnValueOnce(false);
+        mockAdapterGetNetworkParameters.mockReturnValueOnce({panID: 1, extendedPanID: 3, channel: 25});
+        await controller.start();
+        expect(mockAdapterGetNetworkParameters).toHaveBeenCalledTimes(0);
+        expect(mockAdapterChangeChannel).toHaveBeenCalledTimes(0);
+        // get rid of the mockReturnValueOnce that was never called
+        mockAdapterGetNetworkParameters();
     });
 
     it('Set transmit power', async () => {
@@ -820,12 +912,12 @@ describe('Controller', () => {
         expect(databaseContents().includes("0x129")).toBeFalsy();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         expect(equalsPartial(events.deviceJoined[0].device, {ID: 2, networkAddress: 129, ieeeAddr: '0x129'})).toBeTruthy();
-        expect(events.deviceInterview[0]).toStrictEqual({"device":{"_events":{},"_eventsCount":0,"meta": {}, "_skipDefaultResponse": false, "_skipTimeResponse": false, "_lastSeen": deepClone(Date.now()), "ID":2,"_pendingRequestTimeout":0,"_endpoints":[],"_type":"Unknown","_ieeeAddr":"0x129","_interviewCompleted":false,"_interviewing":false,"_networkAddress":129},"status":"started"});
-        const device = {"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_lastSeen": deepClone(Date.now()),"_type":"Unknown","_ieeeAddr":"0x129","_networkAddress":129,"meta": {},"_endpoints":[{"_events":{},"_eventsCount":0,"clusters": {}, "ID":1,"inputClusters":[0,1],"outputClusters":[2],"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x129","sendInProgress": false},"deviceNetworkAddress":129,"deviceIeeeAddress":"0x129","_binds": [], "_configuredReportings": [],"meta":{},"deviceID":5,"profileID":99}],"_type":"Router","_manufacturerID":1212,"_manufacturerName":"KoenAndCo","_powerSource":"Mains (single phase)","_modelID":"myModelID","_applicationVersion":2,"_stackVersion":101,"_zclVersion":1,"_hardwareVersion":3,"_events":{},"_eventsCount":0,"_dateCode":"201901","_softwareBuildID":"1.01","_interviewCompleted":true,"_interviewing":false};
+        expect(events.deviceInterview[0]).toStrictEqual({"device":{"_events":{},"_eventsCount":0,"meta": {}, "_skipDefaultResponse": false, "_lastSeen": deepClone(Date.now()), "ID":2,"_pendingRequestTimeout":0,"_customClusters":{},"_endpoints":[],"_type":"Unknown","_ieeeAddr":"0x129","_interviewCompleted":false,"_interviewing":false,"_networkAddress":129},"status":"started"});
+        const device = {"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_lastSeen": deepClone(Date.now()),"_type":"Unknown","_ieeeAddr":"0x129","_networkAddress":129,"meta": {},"_customClusters":{},"_endpoints":[{"_events":{},"_eventsCount":0,"clusters": {}, "ID":1,"inputClusters":[0,1],"outputClusters":[2],"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x129","sendInProgress": false},"deviceNetworkAddress":129,"deviceIeeeAddress":"0x129","_binds": [], "_configuredReportings": [],"meta":{},"deviceID":5,"profileID":99}],"_type":"Router","_manufacturerID":1212,"_manufacturerName":"KoenAndCo","_powerSource":"Mains (single phase)","_modelID":"myModelID","_applicationVersion":2,"_stackVersion":101,"_zclVersion":1,"_hardwareVersion":3,"_events":{},"_eventsCount":0,"_dateCode":"201901","_softwareBuildID":"1.01","_interviewCompleted":true,"_interviewing":false};
         expect(events.deviceInterview[1]).toStrictEqual({"status":"successful","device":device});
         expect(deepClone(controller.getDeviceByNetworkAddress(129))).toStrictEqual(device);
         expect(events.deviceInterview.length).toBe(2);
-        expect(databaseContents()).toStrictEqual(`{"id":1,"type":"Coordinator","ieeeAddr":"0x123","nwkAddr":123,"manufId":100,"epList":[1,2],"endpoints":{"1":{"profId":2,"epId":1,"devId":3,"inClusterList":[10],"outClusterList":[11],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}},"2":{"profId":3,"epId":2,"devId":5,"inClusterList":[1],"outClusterList":[0],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}}},"interviewCompleted":true,"meta":{},"lastSeen":null}\n{"id":2,"type":"Router","ieeeAddr":"0x129","nwkAddr":129,"manufId":1212,"manufName":"KoenAndCo","powerSource":"Mains (single phase)","modelId":"myModelID","epList":[1],"endpoints":{"1":{"profId":99,"epId":1,"devId":5,"inClusterList":[0,1],"outClusterList":[2],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}}},"appVersion":2,"stackVersion":101,"hwVersion":3,"dateCode":"201901","swBuildId":"1.01","zclVersion":1,"interviewCompleted":true,"meta":{},"lastSeen":150}`);
+        expect(databaseContents()).toStrictEqual(`{"id":1,"type":"Coordinator","ieeeAddr":"0x0000012300000000","nwkAddr":123,"manufId":100,"epList":[1,2],"endpoints":{"1":{"profId":2,"epId":1,"devId":3,"inClusterList":[10],"outClusterList":[11],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}},"2":{"profId":3,"epId":2,"devId":5,"inClusterList":[1],"outClusterList":[0],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}}},"interviewCompleted":true,"meta":{},"lastSeen":null}\n{"id":2,"type":"Router","ieeeAddr":"0x129","nwkAddr":129,"manufId":1212,"manufName":"KoenAndCo","powerSource":"Mains (single phase)","modelId":"myModelID","epList":[1],"endpoints":{"1":{"profId":99,"epId":1,"devId":5,"inClusterList":[0,1],"outClusterList":[2],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}}},"appVersion":2,"stackVersion":101,"hwVersion":3,"dateCode":"201901","swBuildId":"1.01","zclVersion":1,"interviewCompleted":true,"meta":{},"lastSeen":150}`);
         expect(controller.getDeviceByNetworkAddress(129).lastSeen).toBe(Date.now());
     });
 
@@ -838,8 +930,8 @@ describe('Controller', () => {
         expect(databaseContents().includes("0x129")).toBeFalsy();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         expect(equalsPartial(events.deviceJoined[0].device, {ID: 2, networkAddress: 129, ieeeAddr: '0x129'})).toBeTruthy();
-        expect(events.deviceInterview[0]).toStrictEqual({"device":{"meta": {}, "_skipDefaultResponse": false,"_events":{},"_eventsCount":0,"_skipTimeResponse":false,"_lastSeen": deepClone(Date.now()), "ID":2,"_pendingRequestTimeout":0,"_endpoints":[],"_ieeeAddr":"0x129","_interviewCompleted":false,"_interviewing":false,"_networkAddress":129,"_type":"Unknown"},"status":"started"});
-        const device = {"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_lastSeen": deepClone(Date.now()),"_type":"Unknown","_ieeeAddr":"0x129","_networkAddress":129,"meta": {},"_endpoints":[{"_events":{},"_eventsCount":0,"clusters": {}, "ID":1,"inputClusters":[0,1],"meta":{},"outputClusters":[2],"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x129","sendInProgress": false},"deviceNetworkAddress":129,"deviceIeeeAddress":"0x129","_binds": [], "_configuredReportings": [],"deviceID":5,"profileID":99}],"_type":"Router","_manufacturerID":1212,"_manufacturerName":"KoenAndCo","_powerSource":"Mains (single phase)","_modelID":"myModelID","_applicationVersion":2,"_stackVersion":101,"_zclVersion":1,"_hardwareVersion":3,"_events":{},"_eventsCount":0,"_dateCode":"201901","_softwareBuildID":"1.01","_interviewCompleted":true,"_interviewing":false};
+        expect(events.deviceInterview[0]).toStrictEqual({"device":{"meta": {}, "_skipDefaultResponse": false,"_events":{},"_eventsCount":0,"_lastSeen": deepClone(Date.now()), "ID":2,"_pendingRequestTimeout":0,"_customClusters":{},"_endpoints":[],"_ieeeAddr":"0x129","_interviewCompleted":false,"_interviewing":false,"_networkAddress":129,"_type":"Unknown"},"status":"started"});
+        const device = {"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_lastSeen": deepClone(Date.now()),"_type":"Unknown","_ieeeAddr":"0x129","_networkAddress":129,"meta": {},"_customClusters":{},"_endpoints":[{"_events":{},"_eventsCount":0,"clusters": {}, "ID":1,"inputClusters":[0,1],"meta":{},"outputClusters":[2],"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x129","sendInProgress": false},"deviceNetworkAddress":129,"deviceIeeeAddress":"0x129","_binds": [], "_configuredReportings": [],"deviceID":5,"profileID":99}],"_type":"Router","_manufacturerID":1212,"_manufacturerName":"KoenAndCo","_powerSource":"Mains (single phase)","_modelID":"myModelID","_applicationVersion":2,"_stackVersion":101,"_zclVersion":1,"_hardwareVersion":3,"_events":{},"_eventsCount":0,"_dateCode":"201901","_softwareBuildID":"1.01","_interviewCompleted":true,"_interviewing":false};
         expect(events.deviceInterview[1]).toStrictEqual({"status":"successful","device":device});
         expect(deepClone(controller.getDeviceByIeeeAddr('0x129'))).toStrictEqual(device);
         expect(events.deviceInterview.length).toBe(2);
@@ -924,6 +1016,15 @@ describe('Controller', () => {
         await mockAdapterEvents['networkAddress']({networkAddress: 19321, ieeeAddr: '0x19321'});
     });
 
+    it('Network address event should update the last seen value', async () =>  {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        Date.now = jest.fn()
+        Date.now.mockReturnValue(200);
+        await mockAdapterEvents['networkAddress']({networkAddress: 129, ieeeAddr: '0x129'});
+        expect(events.lastSeenChanged[1].device.lastSeen).toBe(200);
+    });
+
     it('Device leave event and remove from database', async () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
@@ -936,8 +1037,22 @@ describe('Controller', () => {
 
         // leaves another time when not in database
         await mockAdapterEvents['deviceLeave']({networkAddress: 129, ieeeAddr: '0x129'});
-        expect(events.deviceLeave.length).toBe(2);
-        expect(events.deviceLeave[1]).toStrictEqual({ieeeAddr: '0x129'});
+        expect(events.deviceLeave.length).toBe(1);
+    });
+
+    it('Device leave event with only nwk addr and remove from database', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        expect(controller.getDeviceByNetworkAddress(129)).toBeInstanceOf(Device);
+        expect(events.deviceLeave.length).toBe(0);
+        await mockAdapterEvents['deviceLeave']({networkAddress: 129, ieeeAddr: null});
+        expect(events.deviceLeave.length).toBe(1);
+        expect(events.deviceLeave[0]).toStrictEqual({ieeeAddr: '0x129'});
+        expect(controller.getDeviceByNetworkAddress(129)).toBeUndefined();
+
+        // leaves another time when not in database
+        await mockAdapterEvents['deviceLeave']({networkAddress: 129, ieeeAddr: null});
+        expect(events.deviceLeave.length).toBe(1);
     });
 
     it('Start with reset should clear database', async () => {
@@ -948,7 +1063,7 @@ describe('Controller', () => {
         expect(controller.getDeviceByIeeeAddr('0x129')).toBeInstanceOf(Device);
         expect((controller.getDevices()).length).toBe(2);
         expect(controller.getDevicesByType('Coordinator')[0].type).toBe('Coordinator');
-        expect(controller.getDevicesByType('Coordinator')[0].ieeeAddr).toBe('0x123');
+        expect(controller.getDevicesByType('Coordinator')[0].ieeeAddr).toBe('0x0000012300000000');
         expect(controller.getDevicesByType('Router')[0].ieeeAddr).toBe('0x129');
         expect(databaseContents().includes('0x129')).toBeTruthy()
         expect(databaseContents().includes('groupID')).toBeTruthy()
@@ -1008,7 +1123,7 @@ describe('Controller', () => {
     it('Controller permit joining', async () => {
         await controller.start();
         await controller.permitJoin(true);
-        expect(mockAdapterPermitJoin).toBeCalledTimes(1);
+        expect(mockAdapterPermitJoin).toHaveBeenCalledTimes(1);
         expect(mockAdapterPermitJoin.mock.calls[0][0]).toBe(254);
         expect(events.permitJoinChanged.length).toBe(1);
         expect(events.permitJoinChanged[0]).toStrictEqual({permitted: true, reason: 'manual', timeout: undefined});
@@ -1025,22 +1140,22 @@ describe('Controller', () => {
         jest.advanceTimersByTime(210 * 1000);
         await flushPromises();
         expect(mocksendZclFrameToAll).toHaveBeenCalledTimes(2);
-        expect(mockAdapterPermitJoin).toBeCalledTimes(2);
+        expect(mockAdapterPermitJoin).toHaveBeenCalledTimes(2);
         expect(mockAdapterPermitJoin.mock.calls[1][0]).toBe(254);
         jest.advanceTimersByTime(210 * 1000);
         await flushPromises();
         expect(mocksendZclFrameToAll).toHaveBeenCalledTimes(3);
-        expect(mockAdapterPermitJoin).toBeCalledTimes(3);
+        expect(mockAdapterPermitJoin).toHaveBeenCalledTimes(3);
         expect(mockAdapterPermitJoin.mock.calls[2][0]).toBe(254);
         expect(events.permitJoinChanged.length).toBe(1);
         expect(controller.getPermitJoin()).toBe(true);
 
         // Disable
         await controller.permitJoin(false);
-        expect(mockAdapterPermitJoin).toBeCalledTimes(4);
+        expect(mockAdapterPermitJoin).toHaveBeenCalledTimes(4);
         expect(mockAdapterPermitJoin.mock.calls[3][0]).toBe(0);
         jest.advanceTimersByTime(210 * 1000);
-        expect(mockAdapterPermitJoin).toBeCalledTimes(4);
+        expect(mockAdapterPermitJoin).toHaveBeenCalledTimes(4);
         expect(events.permitJoinChanged.length).toBe(2);
         expect(events.permitJoinChanged[1]).toStrictEqual({permitted: false, reason: 'manual', timeout: undefined});
         expect(controller.getPermitJoin()).toBe(false);
@@ -1051,19 +1166,19 @@ describe('Controller', () => {
         expect(mocksendZclFrameToAll.mock.calls[3][0]).toBe(242);
         expect(deepClone(mocksendZclFrameToAll.mock.calls[3][1])).toStrictEqual(deepClone(commissionFrameDisable));
         expect(mocksendZclFrameToAll.mock.calls[3][2]).toBe(242);
-        expect(mocksendZclFrameToAll).toBeCalledTimes(4);
+        expect(mocksendZclFrameToAll).toHaveBeenCalledTimes(4);
     });
 
     it('Controller permit joining through specific device', async () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         await controller.permitJoin(true, controller.getDeviceByIeeeAddr('0x129'));
-        expect(mockAdapterPermitJoin).toBeCalledTimes(1);
+        expect(mockAdapterPermitJoin).toHaveBeenCalledTimes(1);
         expect(mockAdapterPermitJoin.mock.calls[0][0]).toBe(254);
         expect(mockAdapterPermitJoin.mock.calls[0][1]).toBe(129);
 
         jest.advanceTimersByTime(210 * 1000);
-        expect(mockAdapterPermitJoin).toBeCalledTimes(2);
+        expect(mockAdapterPermitJoin).toHaveBeenCalledTimes(2);
         expect(mockAdapterPermitJoin.mock.calls[1][0]).toBe(254);
         expect(mockAdapterPermitJoin.mock.calls[1][1]).toBe(129);
     });
@@ -1071,7 +1186,7 @@ describe('Controller', () => {
     it('Controller permit joining for specific time', async () => {
         await controller.start();
         await controller.permitJoin(true, null, 10);
-        expect(mockAdapterPermitJoin).toBeCalledTimes(1);
+        expect(mockAdapterPermitJoin).toHaveBeenCalledTimes(1);
         expect(mockAdapterPermitJoin.mock.calls[0][0]).toBe(254);
         expect(events.permitJoinChanged.length).toBe(1);
         expect(events.permitJoinChanged[0]).toStrictEqual({permitted: true, reason: 'manual', timeout: 10});
@@ -1082,7 +1197,7 @@ describe('Controller', () => {
         expect(controller.getPermitJoinTimeout()).toBe(5);
         jest.advanceTimersByTime(7 * 1000);
         await flushPromises();
-        expect(mockAdapterPermitJoin).toBeCalledTimes(2);
+        expect(mockAdapterPermitJoin).toHaveBeenCalledTimes(2);
         expect(mockAdapterPermitJoin.mock.calls[1][0]).toBe(0);
         expect(events.permitJoinChanged.length).toBe(11);
         expect(events.permitJoinChanged[5]).toStrictEqual({permitted: true, reason: 'manual', timeout: 5});
@@ -1100,22 +1215,39 @@ describe('Controller', () => {
     it('Soft reset', async () => {
         await controller.start();
         await controller.reset('soft');
-        expect(mockAdapterReset).toBeCalledTimes(1);
+        expect(mockAdapterReset).toHaveBeenCalledTimes(1);
         expect(mockAdapterReset).toHaveBeenCalledWith('soft');
     });
 
     it('Hard reset', async () => {
         await controller.start();
         await controller.reset('hard');
-        expect(mockAdapterReset).toBeCalledTimes(1);
+        expect(mockAdapterReset).toHaveBeenCalledTimes(1);
         expect(mockAdapterReset).toHaveBeenCalledWith('hard');
     });
 
-    it('Device announce event', async () => {
+    it('Adapter disconnected event', async () => {
+        // @ts-expect-error private
+        const databaseSaveSpy = jest.spyOn(controller, 'databaseSave');
+        const backupSpy = jest.spyOn(controller, 'backup');
         await controller.start();
+        // @ts-expect-error private
+        databaseSaveSpy.mockClear();
+        backupSpy.mockClear();
+        expect(controller.isStopping()).toBeFalsy();
+        expect(controller.isAdapterDisconnected()).toBeFalsy();
+
         await mockAdapterEvents['disconnected']();
-        expect(mockAdapterStop).toBeCalledTimes(1);
         expect(events.adapterDisconnected.length).toBe(1);
+        expect(controller.isAdapterDisconnected()).toBeTruthy();
+
+        // mock z2m layer responding to disconnected event
+        await controller.stop();
+        expect(controller.isStopping()).toBeTruthy();
+        expect(mockAdapterStop).toHaveBeenCalledTimes(1);// once in event only (with catcho)
+        expect(mockAdapterPermitJoin).not.toHaveBeenCalled();
+        expect(backupSpy).not.toHaveBeenCalled();
+        expect(databaseSaveSpy).toHaveBeenCalledTimes(1);
     });
 
     it('Device joins another time with different network address', async () => {
@@ -1188,13 +1320,13 @@ describe('Controller', () => {
         expect(write[0]).toBe('0x170');
         expect(write[1]).toBe(170);
         expect(write[2]).toBe(1);
-        expect(deepClone(write[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":12,"manufacturerCode":null,"commandIdentifier":2},"Payload":[{"attrId":16,"attrData":"0x123","dataType":240}],"Cluster":{"ID":1280,"attributes":{"zoneState":{"ID":0,"type":48,"name":"zoneState"},"zoneType":{"ID":1,"type":49,"name":"zoneType"},"zoneStatus":{"ID":2,"type":25,"name":"zoneStatus"},"iasCieAddr":{"ID":16,"type":240,"name":"iasCieAddr"},"zoneId":{"ID":17,"type":32,"name":"zoneId"},"numZoneSensitivityLevelsSupported":{"ID":18,"type":32,"name":"numZoneSensitivityLevelsSupported"},"currentZoneSensitivityLevel":{"ID":19,"type":32,"name":"currentZoneSensitivityLevel"},"develcoAlarmOffDelay":{"ID":32769,"type":33,"manufacturerCode":4117,"name":"develcoAlarmOffDelay"}},"name":"ssIasZone","commands":{"enrollRsp":{"ID":0,"parameters":[{"name":"enrollrspcode","type":32},{"name":"zoneid","type":32}],"name":"enrollRsp"},"initNormalOpMode":{"ID":1,"parameters":[],"name":"initNormalOpMode"},"initTestMode":{"ID":2,"parameters":[],"name":"initTestMode"},"boschTestTamper":{"ID":243,"parameters":[{"name":"data","type":32}],"name":"boschTestTamper"},"boschSmokeDetectorSiren":{"ID":128,"parameters":[{"name":"data","type":33}],"name":"boschSmokeDetectorSiren"}},"commandsResponse":{"statusChangeNotification":{"ID":0,"parameters":[{"name":"zonestatus","type":33},{"name":"extendedstatus","type":32}],"name":"statusChangeNotification"},"enrollReq":{"ID":1,"parameters":[{"name":"zonetype","type":33},{"name":"manucode","type":33}],"name":"enrollReq"}}},"Command":{"ID":2,"name":"write","parameters":[{"name":"attrId","type":33},{"name":"dataType","type":32},{"name":"attrData","type":1000}],"response":4}});
+        expect(deepClone(write[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":12,"manufacturerCode":null,"commandIdentifier":2},"payload":[{"attrId":16,"attrData":"0x0000012300000000","dataType":240}],"cluster":{"ID":1280,"attributes":{"zoneState":{"ID":0,"type":48,"name":"zoneState"},"zoneType":{"ID":1,"type":49,"name":"zoneType"},"zoneStatus":{"ID":2,"type":25,"name":"zoneStatus"},"iasCieAddr":{"ID":16,"type":240,"name":"iasCieAddr"},"zoneId":{"ID":17,"type":32,"name":"zoneId"},"numZoneSensitivityLevelsSupported":{"ID":18,"type":32,"name":"numZoneSensitivityLevelsSupported"},"currentZoneSensitivityLevel":{"ID":19,"type":32,"name":"currentZoneSensitivityLevel"},"develcoAlarmOffDelay":{"ID":32769,"type":33,"manufacturerCode":4117,"name":"develcoAlarmOffDelay"}},"name":"ssIasZone","commands":{"enrollRsp":{"ID":0,"parameters":[{"name":"enrollrspcode","type":32},{"name":"zoneid","type":32}],"name":"enrollRsp"},"initNormalOpMode":{"ID":1,"parameters":[],"name":"initNormalOpMode"},"initTestMode":{"ID":2,"parameters":[],"name":"initTestMode"},"boschTestTamper":{"ID":243,"parameters":[{"name":"data","type":32}],"name":"boschTestTamper"},"boschSmokeDetectorSiren":{"ID":128,"parameters":[{"name":"data","type":33}],"name":"boschSmokeDetectorSiren"}},"commandsResponse":{"statusChangeNotification":{"ID":0,"parameters":[{"name":"zonestatus","type":33},{"name":"extendedstatus","type":32}],"name":"statusChangeNotification"},"enrollReq":{"ID":1,"parameters":[{"name":"zonetype","type":33},{"name":"manucode","type":33}],"name":"enrollReq"}}},"command":{"ID":2,"name":"write","parameters":[{"name":"attrId","type":33},{"name":"dataType","type":32},{"name":"attrData","type":1000}],"response":4}});
 
         const enrollRsp = mocksendZclFrameToEndpoint.mock.calls[11];
         expect(enrollRsp[0]).toBe('0x170');
         expect(enrollRsp[1]).toBe(170);
         expect(enrollRsp[2]).toBe(1);
-        expect(deepClone(enrollRsp[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":13,"manufacturerCode":null,"commandIdentifier":0},"Payload":{"enrollrspcode":0,"zoneid":23},"Cluster":{"ID":1280,"attributes":{"zoneState":{"ID":0,"type":48,"name":"zoneState"},"zoneType":{"ID":1,"type":49,"name":"zoneType"},"zoneStatus":{"ID":2,"type":25,"name":"zoneStatus"},"iasCieAddr":{"ID":16,"type":240,"name":"iasCieAddr"},"zoneId":{"ID":17,"type":32,"name":"zoneId"},"numZoneSensitivityLevelsSupported":{"ID":18,"type":32,"name":"numZoneSensitivityLevelsSupported"},"currentZoneSensitivityLevel":{"ID":19,"type":32,"name":"currentZoneSensitivityLevel"},"develcoAlarmOffDelay":{"ID":32769,"type":33,"manufacturerCode":4117,"name":"develcoAlarmOffDelay"}},"name":"ssIasZone","commands":{"enrollRsp":{"ID":0,"parameters":[{"name":"enrollrspcode","type":32},{"name":"zoneid","type":32}],"name":"enrollRsp"},"initNormalOpMode":{"ID":1,"parameters":[],"name":"initNormalOpMode"},"initTestMode":{"ID":2,"parameters":[],"name":"initTestMode"},"boschTestTamper":{"ID":243,"parameters":[{"name":"data","type":32}],"name":"boschTestTamper"},"boschSmokeDetectorSiren":{"ID":128,"parameters":[{"name":"data","type":33}],"name":"boschSmokeDetectorSiren"}},"commandsResponse":{"statusChangeNotification":{"ID":0,"parameters":[{"name":"zonestatus","type":33},{"name":"extendedstatus","type":32}],"name":"statusChangeNotification"},"enrollReq":{"ID":1,"parameters":[{"name":"zonetype","type":33},{"name":"manucode","type":33}],"name":"enrollReq"}}},"Command":{"ID":0,"parameters":[{"name":"enrollrspcode","type":32},{"name":"zoneid","type":32}],"name":"enrollRsp"}});
+        expect(deepClone(enrollRsp[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":13,"manufacturerCode":null,"commandIdentifier":0},"payload":{"enrollrspcode":0,"zoneid":23},"cluster":{"ID":1280,"attributes":{"zoneState":{"ID":0,"type":48,"name":"zoneState"},"zoneType":{"ID":1,"type":49,"name":"zoneType"},"zoneStatus":{"ID":2,"type":25,"name":"zoneStatus"},"iasCieAddr":{"ID":16,"type":240,"name":"iasCieAddr"},"zoneId":{"ID":17,"type":32,"name":"zoneId"},"numZoneSensitivityLevelsSupported":{"ID":18,"type":32,"name":"numZoneSensitivityLevelsSupported"},"currentZoneSensitivityLevel":{"ID":19,"type":32,"name":"currentZoneSensitivityLevel"},"develcoAlarmOffDelay":{"ID":32769,"type":33,"manufacturerCode":4117,"name":"develcoAlarmOffDelay"}},"name":"ssIasZone","commands":{"enrollRsp":{"ID":0,"parameters":[{"name":"enrollrspcode","type":32},{"name":"zoneid","type":32}],"name":"enrollRsp"},"initNormalOpMode":{"ID":1,"parameters":[],"name":"initNormalOpMode"},"initTestMode":{"ID":2,"parameters":[],"name":"initTestMode"},"boschTestTamper":{"ID":243,"parameters":[{"name":"data","type":32}],"name":"boschTestTamper"},"boschSmokeDetectorSiren":{"ID":128,"parameters":[{"name":"data","type":33}],"name":"boschSmokeDetectorSiren"}},"commandsResponse":{"statusChangeNotification":{"ID":0,"parameters":[{"name":"zonestatus","type":33},{"name":"extendedstatus","type":32}],"name":"statusChangeNotification"},"enrollReq":{"ID":1,"parameters":[{"name":"zonetype","type":33},{"name":"manucode","type":33}],"name":"enrollReq"}}},"command":{"ID":0,"parameters":[{"name":"enrollrspcode","type":32},{"name":"zoneid","type":32}],"name":"enrollRsp"}});
     });
 
     it('Device joins and interview iAs enrollment fails', async () => {
@@ -1222,12 +1354,16 @@ describe('Controller', () => {
     });
 
     it('Receive zclData occupancy report', async () => {
+        const buffer = Buffer.from([24,169,10,0,0,24,1]);
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Zcl.Header.fromBuffer(buffer), buffer);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: '0x129',
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
@@ -1246,7 +1382,7 @@ describe('Controller', () => {
                 "_lastSeen": deepClone(Date.now()),
                 "_linkquality":50,
                 "_skipDefaultResponse": false,
-                "_skipTimeResponse": false,
+                "_customClusters": {},
                 "_endpoints":[
                     {
                     "ID":1,
@@ -1336,11 +1472,11 @@ describe('Controller', () => {
         await controller.start();
         mocksendZclFrameToAll.mockClear();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['rawData']({
+        await mockAdapterEvents['zclPayload']({
             clusterID: 9,
             address: 129,
-            data: Buffer.from([0, 1, 2, 3]),
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+            data: Buffer.from([0, 1]),
+            header: new Zcl.Header({direction: 0, disableDefaultResponse: false, frameType: 1, manufacturerSpecific: false, reservedBits: 0}, 0, 1, 0),
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
@@ -1360,7 +1496,7 @@ describe('Controller', () => {
                 "_lastSeen": deepClone(Date.now()),
                 "_linkquality":50,
                 "_skipDefaultResponse": false,
-                "_skipTimeResponse": false,
+                "_customClusters": {},
                 "_endpoints":[
                     {
                     "ID":1,
@@ -1414,7 +1550,7 @@ describe('Controller', () => {
                 "meta":{},
             },
             "data": {
-                data: [0, 1, 2, 3],
+                data: [0, 1],
                 type: 'Buffer',
             },
             "linkquality":50,
@@ -1425,13 +1561,13 @@ describe('Controller', () => {
     });
 
     it('Receive raw data from unknown cluster', async () => {
+        const buffer = Buffer.from([24,169,10,0,0,24,1]);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['rawData']({
+        await mockAdapterEvents['zclPayload']({
             clusterID: 99999999,
             address: 129,
             data: Buffer.from([0, 1, 2, 3]),
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
@@ -1450,7 +1586,7 @@ describe('Controller', () => {
                 "_lastSeen": deepClone(Date.now()),
                 "_linkquality":50,
                 "_skipDefaultResponse": false,
-                "_skipTimeResponse": false,
+                "_customClusters": {},
                 "_endpoints":[
                     {
                     "ID":1,
@@ -1516,12 +1652,16 @@ describe('Controller', () => {
     });
 
     it('Receive zclData from unkonwn device shouldnt emit anything', async () => {
+        const buffer = Buffer.from([24,169,10,0,0,24,1]);
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Zcl.Header.fromBuffer(buffer), buffer);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             networkAddress: 130,
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
@@ -1531,12 +1671,16 @@ describe('Controller', () => {
     });
 
     it('Receive readResponse from unknown endpoint', async () => {
+        const buffer = Buffer.from([8, 1, 1, 1, 0, 0, 32, 3]);
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("genBasic").ID, Zcl.Header.fromBuffer(buffer), buffer);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("genBasic").ID, Buffer.from([8, 1, 1, 1, 0, 0, 32, 3])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 3,
             linkquality: 52,
             groupID: undefined,
@@ -1554,8 +1698,8 @@ describe('Controller', () => {
                "_pendingRequestTimeout": 0,
                "_linkquality":52,
                 "_skipDefaultResponse": false,
-                "_skipTimeResponse": false,
                "_networkAddress":129,
+               "_customClusters": {},
                "_endpoints":[
                   {
                      "clusters": {},
@@ -1661,12 +1805,16 @@ describe('Controller', () => {
     });
 
     it('Receive cluster command', async () => {
+        const buffer = Buffer.from([0x05, 0x7c, 0x11, 0x1d, 0x07, 0x00, 0x01, 0x0d, 0x00]);
+        const frame = Zcl.Frame.fromBuffer(5, Zcl.Header.fromBuffer(buffer), buffer);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.fromBuffer(5, Buffer.from([0x05, 0x7c, 0x11, 0x1d, 0x07, 0x00, 0x01, 0x0d, 0x00])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
@@ -1683,9 +1831,9 @@ describe('Controller', () => {
                "_lastSeen": deepClone(Date.now()),
                "_linkquality":19,
                 "_skipDefaultResponse": false,
-                "_skipTimeResponse": false,
                "_ieeeAddr":"0x129",
                "_networkAddress":129,
+               "_customClusters":{},
                "_endpoints":[
                   {
                      "ID":1,
@@ -1766,12 +1914,15 @@ describe('Controller', () => {
     });
 
     it('Receive cluster command from unknown cluster', async () => {
+        const frame = Zcl.Frame.create(1, 1, false, 4476, 29, 1, 5, {groupid: 1, sceneid: 1, status: 0, transtime: 0, scenename: '', extensionfieldsets: []});
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             networkAddress: 129,
-            frame: ZclFrame.create(1, 1, false, 4476, 29, 1, 5, {groupid: 1, sceneid: 1}),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
@@ -1781,140 +1932,163 @@ describe('Controller', () => {
     });
 
     it('Receive zclData send default response', async () => {
+        const frame = Zcl.Frame.create(1, 1, false, 4476, 29, 1, 5, {groupid: 1, sceneid: 1, status: 0, transtime: 0, scenename: '', extensionfieldsets: []});
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         mocksendZclFrameToEndpoint.mockClear();
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.create(1, 1, false, 4476, 29, 1, 5, {groupid: 1, sceneid: 1}),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
         });
 
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":29,"manufacturerCode":null,"commandIdentifier":11},"Payload":{"cmdId":1,"statusCode":0},"Cluster":{"ID":5,"attributes":{"count":{"ID":0,"type":32,"name":"count"},"currentScene":{"ID":1,"type":32,"name":"currentScene"},"currentGroup":{"ID":2,"type":33,"name":"currentGroup"},"sceneValid":{"ID":3,"type":16,"name":"sceneValid"},"nameSupport":{"ID":4,"type":24,"name":"nameSupport"},"lastCfgBy":{"ID":5,"type":240,"name":"lastCfgBy"}},"name":"genScenes","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32},{"name":"transtime","type":33},{"name":"scenename","type":66},{"name":"extensionfieldsets","type":1006}],"name":"add"},"view":{"ID":1,"response":1,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"view"},"remove":{"ID":2,"response":2,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"remove"},"removeAll":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"removeAll"},"store":{"ID":4,"response":4,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"store"},"recall":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"recall"},"getSceneMembership":{"ID":6,"response":6,"parameters":[{"name":"groupid","type":33}],"name":"getSceneMembership"},"enhancedAdd":{"ID":64,"response":64,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32},{"name":"transtime","type":33},{"name":"scenename","type":66},{"name":"extensionfieldsets","type":1006}],"name":"enhancedAdd"},"enhancedView":{"ID":65,"response":65,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"enhancedView"},"copy":{"ID":66,"response":66,"parameters":[{"name":"mode","type":32},{"name":"groupidfrom","type":33},{"name":"sceneidfrom","type":32},{"name":"groupidto","type":33},{"name":"sceneidto","type":32}],"name":"copy"},"tradfriArrowSingle":{"ID":7,"parameters":[{"name":"value","type":33},{"name":"value2","type":33}],"name":"tradfriArrowSingle"},"tradfriArrowHold":{"ID":8,"parameters":[{"name":"value","type":33}],"name":"tradfriArrowHold"},"tradfriArrowRelease":{"ID":9,"parameters":[{"name":"value","type":33}],"name":"tradfriArrowRelease"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupId","type":33},{"name":"sceneId","type":32}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"sceneid","type":32},{"name":"transtime","type":33},{"name":"scenename","type":66},{"name":"extensionfieldsets","type":1006}],"name":"viewRsp"},"removeRsp":{"ID":2,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"removeRsp"},"removeAllRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeAllRsp"},"storeRsp":{"ID":4,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"storeRsp"},"getSceneMembershipRsp":{"ID":6,"parameters":[{"name":"status","type":32},{"name":"capacity","type":32},{"name":"groupid","type":33},{"name":"scenecount","type":32},{"name":"scenelist","type":1001}],"name":"getSceneMembershipRsp"},"enhancedAddRsp":{"ID":64,"parameters":[],"name":"enhancedAddRsp"},"enhancedViewRsp":{"ID":65,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"sceneid","type":32},{"name":"transtime","type":33},{"name":"scenename","type":66},{"name":"extensionfieldsets","type":1006}],"name":"enhancedViewRsp"},"copyRsp":{"ID":66,"parameters":[{"name":"status","type":32},{"name":"groupidfrom","type":33},{"name":"sceneidfrom","type":32}],"name":"copyRsp"}}},"Command":{"ID":11,"name":"defaultRsp","parameters":[{"name":"cmdId","type":32},{"name":"statusCode","type":32}]}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":29,"manufacturerCode":null,"commandIdentifier":11},"payload":{"cmdId":1,"statusCode":0},"cluster":{"ID":5,"attributes":{"count":{"ID":0,"type":32,"name":"count"},"currentScene":{"ID":1,"type":32,"name":"currentScene"},"currentGroup":{"ID":2,"type":33,"name":"currentGroup"},"sceneValid":{"ID":3,"type":16,"name":"sceneValid"},"nameSupport":{"ID":4,"type":24,"name":"nameSupport"},"lastCfgBy":{"ID":5,"type":240,"name":"lastCfgBy"}},"name":"genScenes","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32},{"name":"transtime","type":33},{"name":"scenename","type":66},{"name":"extensionfieldsets","type":1006}],"name":"add"},"view":{"ID":1,"response":1,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"view"},"remove":{"ID":2,"response":2,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"remove"},"removeAll":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"removeAll"},"store":{"ID":4,"response":4,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"store"},"recall":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"recall"},"getSceneMembership":{"ID":6,"response":6,"parameters":[{"name":"groupid","type":33}],"name":"getSceneMembership"},"enhancedAdd":{"ID":64,"response":64,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32},{"name":"transtime","type":33},{"name":"scenename","type":66},{"name":"extensionfieldsets","type":1006}],"name":"enhancedAdd"},"enhancedView":{"ID":65,"response":65,"parameters":[{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"enhancedView"},"copy":{"ID":66,"response":66,"parameters":[{"name":"mode","type":32},{"name":"groupidfrom","type":33},{"name":"sceneidfrom","type":32},{"name":"groupidto","type":33},{"name":"sceneidto","type":32}],"name":"copy"},"tradfriArrowSingle":{"ID":7,"parameters":[{"name":"value","type":33},{"name":"value2","type":33}],"name":"tradfriArrowSingle"},"tradfriArrowHold":{"ID":8,"parameters":[{"name":"value","type":33}],"name":"tradfriArrowHold"},"tradfriArrowRelease":{"ID":9,"parameters":[{"name":"value","type":33}],"name":"tradfriArrowRelease"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupId","type":33},{"name":"sceneId","type":32}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"sceneid","type":32},{"name":"transtime","type":33},{"name":"scenename","type":66},{"name":"extensionfieldsets","type":1006}],"name":"viewRsp"},"removeRsp":{"ID":2,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"removeRsp"},"removeAllRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeAllRsp"},"storeRsp":{"ID":4,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"sceneid","type":32}],"name":"storeRsp"},"getSceneMembershipRsp":{"ID":6,"parameters":[{"name":"status","type":32},{"name":"capacity","type":32},{"name":"groupid","type":33},{"name":"scenecount","type":32},{"name":"scenelist","type":1001}],"name":"getSceneMembershipRsp"},"enhancedAddRsp":{"ID":64,"parameters":[],"name":"enhancedAddRsp"},"enhancedViewRsp":{"ID":65,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"sceneid","type":32},{"name":"transtime","type":33},{"name":"scenename","type":66},{"name":"extensionfieldsets","type":1006}],"name":"enhancedViewRsp"},"copyRsp":{"ID":66,"parameters":[{"name":"status","type":32},{"name":"groupidfrom","type":33},{"name":"sceneidfrom","type":32}],"name":"copyRsp"}}},"command":{"ID":11,"name":"defaultRsp","parameters":[{"name":"cmdId","type":32},{"name":"statusCode","type":32}]}});
     });
 
     it('Receive zclData dont send default resopnse with skipDefaultResponse', async () => {
+        const frame = Zcl.Frame.create(1, 1, false, 4476, 29, 1, 5, {groupid: 1, sceneid: 1, status: 0, transtime: 0, scenename: '', extensionfieldsets: []});
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         mocksendZclFrameToEndpoint.mockClear();
         const device = controller.getDeviceByIeeeAddr('0x129');
         expect(device.skipDefaultResponse).toBeFalsy();
         device.skipDefaultResponse = true;
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.create(1, 1, false, 4476, 29, 1, 5, {groupid: 1, sceneid: 1}),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
         });
         expect(device.skipDefaultResponse).toBeTruthy();
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
     });
 
     it('Receive zclData dont send default resopnse when broadcast', async () => {
+        const frame = Zcl.Frame.create(1, 1, false, 4476, 29, 1, 5, {groupid: 1, sceneid: 1, status: 0, transtime: 0, scenename: '', extensionfieldsets: []});
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         mocksendZclFrameToEndpoint.mockClear();
         const device = controller.getDeviceByIeeeAddr('0x129');
         expect(device.skipDefaultResponse).toBeFalsy();
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: true,
             address: 129,
-            frame: ZclFrame.create(1, 1, false, 4476, 29, 1, 5, {groupid: 1, sceneid: 1}),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
         });
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
     });
 
     it('Receive zclData send default response fails should NOT attempt route discover when adapter does not support it', async () => {
+        const frame = Zcl.Frame.create(1, 1, false, 4476, 29, 1, 5, {groupid: 1, sceneid: 1, status: 0, transtime: 0, scenename: '', extensionfieldsets: []});
         mockAdapterSupportsDiscoverRoute.mockReturnValueOnce(false);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         mocksendZclFrameToEndpoint.mockClear();
         mockDiscoverRoute.mockClear();
         mocksendZclFrameToEndpoint.mockRejectedValue("");
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.create(1, 1, false, 4476, 29, 1, 5, {groupid: 1, sceneid: 1}),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
         });
 
-        expect(mockDiscoverRoute).toBeCalledTimes(0);
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
-    });
-
-    it('Dont respond to genTime read when disabled', async () => {
-        await controller.start();
-        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        mocksendZclFrameToEndpoint.mockClear();
-
-        const device = controller.getDeviceByIeeeAddr('0x129');
-        expect(device.skipTimeResponse).toBeFalsy();
-        device.skipTimeResponse = true;
-        await mockAdapterEvents['zclData']({
-            wasBroadcast: false,
-            address: 129,
-            frame: ZclFrame.create(0, 0, true, null, 40, 0, 10, [{attrId: 0}, {attrId: 1}, {attrId: 7}, {attrId: 9}]),
-            endpoint: 1,
-            linkquality: 19,
-            groupID: 10,
-        });
-
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(0);
+        expect(mockDiscoverRoute).toHaveBeenCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
     });
 
     it('Respond to genTime read', async () => {
+        const frame = Zcl.Frame.create(0, 0, true, null, 40, 0, 10, [{attrId: 0}, {attrId: 1}, {attrId: 7}, {attrId: 4}]);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         mocksendZclFrameToEndpoint.mockClear();
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.create(0, 0, true, null, 40, 0, 10, [{attrId: 0}, {attrId: 1}, {attrId: 7}, {attrId: 4}]),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
         });
 
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         expect(mocksendZclFrameToEndpoint.mock.calls[0][0]).toBe('0x129');
         expect(mocksendZclFrameToEndpoint.mock.calls[0][1]).toBe(129);
         expect(mocksendZclFrameToEndpoint.mock.calls[0][2]).toBe(1);
         const message = mocksendZclFrameToEndpoint.mock.calls[0][3];
         // attrId 9 is not supported by controller.ts therefore should not be in the response
-        expect(message.Payload.length).toBe(3);
-        expect(message.Payload[0].attrId).toBe(0);
-        expect(message.Payload[0].dataType).toBe(226);
-        expect(message.Payload[0].status).toBe(0);
-        expect(message.Payload[0].attrData).toBeGreaterThan(600822353);
-        expect(message.Payload[1].attrId).toBe(1);
-        expect(message.Payload[1].dataType).toBe(24);
-        expect(message.Payload[1].status).toBe(0);
-        expect(message.Payload[1].attrData).toBe(3);
-        expect(message.Payload[2].attrId).toBe(7);
-        expect(message.Payload[2].dataType).toBe(35);
-        expect(message.Payload[2].status).toBe(0);
-        expect(message.Payload[2].attrData).toBeGreaterThan(600822353);
-        delete message.Payload;
+        expect(message.payload.length).toBe(3);
+        expect(message.payload[0].attrId).toBe(0);
+        expect(message.payload[0].dataType).toBe(226);
+        expect(message.payload[0].status).toBe(0);
+        expect(message.payload[0].attrData).toBeGreaterThan(600822353);
+        expect(message.payload[1].attrId).toBe(1);
+        expect(message.payload[1].dataType).toBe(24);
+        expect(message.payload[1].status).toBe(0);
+        expect(message.payload[1].attrData).toBe(3);
+        expect(message.payload[2].attrId).toBe(7);
+        expect(message.payload[2].dataType).toBe(35);
+        expect(message.payload[2].status).toBe(0);
+        expect(message.payload[2].attrData).toBeGreaterThan(600822353);
+        delete message.payload;
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":40,"manufacturerCode":null,"commandIdentifier":1},"Cluster":{"ID":10,"attributes":{"time":{"ID":0,"type":226,"name":"time"},"timeStatus":{"ID":1,"type":24,"name":"timeStatus"},"timeZone":{"ID":2,"type":43,"name":"timeZone"},"dstStart":{"ID":3,"type":35,"name":"dstStart"},"dstEnd":{"ID":4,"type":35,"name":"dstEnd"},"dstShift":{"ID":5,"type":43,"name":"dstShift"},"standardTime":{"ID":6,"type":35,"name":"standardTime"},"localTime":{"ID":7,"type":35,"name":"localTime"},"lastSetTime":{"ID":8,"type":226,"name":"lastSetTime"},"validUntilTime":{"ID":9,"type":226,"name":"validUntilTime"}},"name":"genTime","commands":{},"commandsResponse":{}},"Command":{"ID":1,"name":"readRsp","parameters":[{"name":"attrId","type":33},{"name":"status","type":32},{"name":"dataType","type":32,"conditions":[{"type":"statusEquals","value":0}]},{"name":"attrData","type":1000,"conditions":[{"type":"statusEquals","value":0}]}]}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":40,"manufacturerCode":null,"commandIdentifier":1},"cluster":{"ID":10,"attributes":{"time":{"ID":0,"type":226,"name":"time"},"timeStatus":{"ID":1,"type":24,"name":"timeStatus"},"timeZone":{"ID":2,"type":43,"name":"timeZone"},"dstStart":{"ID":3,"type":35,"name":"dstStart"},"dstEnd":{"ID":4,"type":35,"name":"dstEnd"},"dstShift":{"ID":5,"type":43,"name":"dstShift"},"standardTime":{"ID":6,"type":35,"name":"standardTime"},"localTime":{"ID":7,"type":35,"name":"localTime"},"lastSetTime":{"ID":8,"type":226,"name":"lastSetTime"},"validUntilTime":{"ID":9,"type":226,"name":"validUntilTime"}},"name":"genTime","commands":{},"commandsResponse":{}},"command":{"ID":1,"name":"readRsp","parameters":[{"name":"attrId","type":33},{"name":"status","type":32},{"name":"dataType","type":32,"conditions":[{"type":"statusEquals","value":0}]},{"name":"attrData","type":1000,"conditions":[{"type":"statusEquals","value":0}]}]}});
+    });
+
+    it('Allow to override read response through `device.customReadResponse', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        mocksendZclFrameToEndpoint.mockClear();
+
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        device.customReadResponse = jest.fn().mockReturnValue(true);
+
+        const frame = Zcl.Frame.create(0, 0, true, null, 40, 0, 10, [{attrId: 0}, {attrId: 1}, {attrId: 7}, {attrId: 9}]);
+        const payload = {
+            wasBroadcast: false,
+            address: 129,
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
+            endpoint: 1,
+            linkquality: 19,
+            groupID: 10,
+        };
+
+        await mockAdapterEvents['zclPayload'](payload);
+
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
+        expect(device.customReadResponse).toHaveBeenCalledTimes(1);
+        expect(device.customReadResponse).toHaveBeenCalledWith(expect.any(Zcl.Frame), device.getEndpoint(1))
+        expect(device.customReadResponse.mock.calls[0][0].header).toBe(payload.header);
     });
 
     it('Respond to read of attribute', async () => {
@@ -1924,21 +2098,24 @@ describe('Controller', () => {
         const endpoint = device.getEndpoint(1);
         endpoint.saveClusterAttributeKeyValue('hvacThermostat', {systemMode: 3});
         mocksendZclFrameToEndpoint.mockClear();
-        await mockAdapterEvents['zclData']({
+        const frame = Zcl.Frame.create(0, 0, true, null, 40, 0, 513, [{attrId: 28}, {attrId: 290}]);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.create(0, 0, true, null, 40, 0, 513, [{attrId: 28}, {attrId: 2901238}]),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
         });
 
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone({...call[3], Cluster: null})).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":40,"manufacturerCode":null,"commandIdentifier":1},"Payload":[{"attrId":28,"attrData":3,"dataType":48,"status":0}],"Cluster":null,"Command":{"ID":1,"name":"readRsp","parameters":[{"name":"attrId","type":33},{"name":"status","type":32},{"name":"dataType","type":32,"conditions":[{"type":"statusEquals","value":0}]},{"name":"attrData","type":1000,"conditions":[{"type":"statusEquals","value":0}]}]}});
+        expect(deepClone({...call[3], cluster: null})).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":40,"manufacturerCode":null,"commandIdentifier":1},"payload":[{"attrId":28,"attrData":3,"dataType":48,"status":0}],"cluster":null,"command":{"ID":1,"name":"readRsp","parameters":[{"name":"attrId","type":33},{"name":"status","type":32},{"name":"dataType","type":32,"conditions":[{"type":"statusEquals","value":0}]},{"name":"attrData","type":1000,"conditions":[{"type":"statusEquals","value":0}]}]}});
     });
 
     it('Respond to genTime read fails', async () => {
@@ -1946,16 +2123,19 @@ describe('Controller', () => {
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
         mocksendZclFrameToEndpoint.mockClear();
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error(""));
-        await mockAdapterEvents['zclData']({
+        const frame = Zcl.Frame.create(0, 0, true, null, 40, 0, 10, [{attrId: 0}]);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.create(0, 0, true, null, 40, 0, 10, [{attrId: 0}]),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
         });
 
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
     });
 
     it('TuYa end devices joins, stops responding after 1 requests, should read modelID and manufacturerName immediately on second pair', async () => {
@@ -1969,7 +2149,7 @@ describe('Controller', () => {
         expect(events.deviceInterview[0].device._ieeeAddr).toBe('0x173')
         expect(events.deviceInterview[1].status).toBe('failed')
         expect(events.deviceInterview[1].device._ieeeAddr).toBe('0x173')
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         expect(controller.getDeviceByIeeeAddr('0x173').modelID).toBe(undefined)
         expect(controller.getDeviceByIeeeAddr('0x173').manufacturerName).toBe(undefined)
 
@@ -1984,7 +2164,7 @@ describe('Controller', () => {
         expect(events.deviceInterview[2].device._ieeeAddr).toBe('0x173')
         expect(events.deviceInterview[3].status).toBe('successful')
         expect(events.deviceInterview[3].device._ieeeAddr).toBe('0x173')
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(2);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
 
         expect(controller.getDeviceByIeeeAddr('0x173').modelID).toBe('TS0203')
         expect(controller.getDeviceByIeeeAddr('0x173').manufacturerName).toBe('_TYZB01_xph99wvr')
@@ -2034,7 +2214,7 @@ describe('Controller', () => {
                 "_lastSeen": deepClone(Date.now()),
                 "_linkquality":50,
                 "_skipDefaultResponse": false,
-                "_skipTimeResponse": false,
+                "_customClusters": {},
                 "_endpoints":[
                    {
                       "ID":1,
@@ -2089,7 +2269,7 @@ describe('Controller', () => {
                 "_lastSeen": deepClone(Date.now()),
                 "_linkquality":50,
                 "_skipDefaultResponse": false,
-                "_skipTimeResponse": false,
+                "_customClusters": {},
                 "_endpoints":[
                    {
                       "ID":1,
@@ -2130,11 +2310,15 @@ describe('Controller', () => {
     it('Receive zclData report from unkown attribute', async () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        const buffer = [28,95,17,3,10,5,0,66,21,108,117,109,105,46,115,101,110,115,111,114,95,119,108,101,97,107,46,97,113,49,1,255,66,34,1,33,213,12,3,40,33,4,33,168,19,5,33,43,0,6,36,0,0,5,0,0,8,33,4,2,10,33,0,0,100,16,0];
-        await mockAdapterEvents['zclData']({
+        const buffer = Buffer.from([28,95,17,3,10,5,0,66,21,108,117,109,105,46,115,101,110,115,111,114,95,119,108,101,97,107,46,97,113,49,1,255,66,34,1,33,213,12,3,40,33,4,33,168,19,5,33,43,0,6,36,0,0,5,0,0,8,33,4,2,10,33,0,0,100,16,0]);
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("genBasic").ID, Zcl.Header.fromBuffer(buffer), buffer);
+        jest.spyOn(Zcl.Frame, 'fromBuffer').mockReturnValueOnce(frame); // Mock because no Buffalo write isn't supported for this payload
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("genBasic").ID, Buffer.from(buffer)),
+            clusterID: frame.cluster.ID,
+            data: null, // null intentionally
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
@@ -2149,10 +2333,10 @@ describe('Controller', () => {
                 "_lastSeen": deepClone(Date.now()),
                 "_linkquality":50,
                 "_skipDefaultResponse": false,
-                "_skipTimeResponse": false,
                 "ID":2,
                 "_ieeeAddr":"0x129",
                 "_networkAddress":129,
+                "_customClusters": {},
                 "_endpoints":[
                     {
                         "_events":{},"_eventsCount":0,
@@ -2268,8 +2452,99 @@ describe('Controller', () => {
                     "manufacturerSpecific": true,
                 },
             },
-         };
+        };
         expect(deepClone(events.message[0])).toStrictEqual(expected);
+    });
+
+    it('Should allow to specify custom attributes for existing cluster', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        device.addCustomCluster('genBasic', {ID: 0, commands: {}, commandsResponse: {}, attributes: {
+            customAttr: {ID: 256, type: Zcl.DataType.UINT8},
+            aDifferentZclVersion: {ID: 0, type: Zcl.DataType.UINT8},
+        }});
+        const buffer = Buffer.from([24,169,10,0,1,24,3,0,0,24,1,2,0,24,1]);
+        const header = Zcl.Header.fromBuffer(buffer);
+        await mockAdapterEvents['zclPayload']({wasBroadcast: false, address: 129, clusterID: 0, data: buffer, header, endpoint: 1, linkquality: 50, groupID: 1});
+        expect(events.message.length).toBe(1);
+        expect(events.message[0].data).toStrictEqual({customAttr: 3, aDifferentZclVersion: 1, stackVersion: 1});
+        expect(events.message[0].cluster).toBe('genBasic');
+    });
+
+    it('Should allow to specify custom cluster', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        device.addCustomCluster('myCustomCluster', {ID: 9123, commands: {}, commandsResponse: {}, attributes: {superAttribute: {ID: 0, type: Zcl.DataType.UINT8}}});
+        const buffer = Buffer.from([24,169,10,0,1,24,3,0,0,24,1]);
+        const header = Zcl.Header.fromBuffer(buffer);
+        await mockAdapterEvents['zclPayload']({wasBroadcast: false, address: 129, clusterID: 9123, data: buffer, header, endpoint: 1, linkquality: 50, groupID: 1});
+        expect(events.message.length).toBe(1);
+        expect(events.message[0].data).toStrictEqual({superAttribute: 1, '256': 3});
+        expect(events.message[0].cluster).toBe('myCustomCluster');
+    });
+
+    it('Should allow to specify custom cluster as override for Zcl cluster', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        device.addCustomCluster('myCustomCluster', {ID: Zcl.Clusters.genBasic.ID, commands: {}, commandsResponse: {}, attributes: {customAttr: {ID: 256, type: Zcl.DataType.UINT8}}});
+        const buffer = Buffer.from([24,169,10,0,1,24,3,0,0,24,1]);
+        const header = Zcl.Header.fromBuffer(buffer);
+        await mockAdapterEvents['zclPayload']({wasBroadcast: false, address: 129, clusterID: Zcl.Clusters.genBasic.ID, data: buffer, header, endpoint: 1, linkquality: 50, groupID: 1});
+        expect(events.message.length).toBe(1);
+        expect(events.message[0].data).toStrictEqual({customAttr: 3, 0: 1/*zclVersion no longer recognized, cluster is overridden*/});
+        expect(events.message[0].cluster).toBe('myCustomCluster');
+    });
+
+    it('Send zcl command to all no options', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        device.getEndpoint(1).zclCommandBroadcast(255, BroadcastAddress.SLEEPY, Zcl.Clusters.ssIasZone.ID, 'boschSmokeDetectorSiren', {data: 0x0000});
+        const sentFrame = mockZclFrame.create(
+            Zcl.FrameType.SPECIFIC,
+            Zcl.Direction.CLIENT_TO_SERVER,
+            true,
+            null,
+            // @ts-expect-error private
+            ZclTransactionSequenceNumber.number,
+            'boschSmokeDetectorSiren',
+            Zcl.Clusters.ssIasZone.ID,
+            {data: 0x0000},
+            device.customClusters
+        );
+        expect(mocksendZclFrameToAll.mock.calls[0][0]).toBe(255);
+        expect(deepClone(mocksendZclFrameToAll.mock.calls[0][1])).toStrictEqual(deepClone(sentFrame));
+        expect(mocksendZclFrameToAll.mock.calls[0][2]).toBe(1);
+        expect(mocksendZclFrameToAll.mock.calls[0][3]).toBe(BroadcastAddress.SLEEPY);
+        expect(mocksendZclFrameToAll).toHaveBeenCalledTimes(1);
+    });
+
+    it('Send zcl command to all with manufacturer option', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        const options = {manufacturerCode: Zcl.ManufacturerCode.ROBERT_BOSCH_GMBH};
+        device.getEndpoint(1).zclCommandBroadcast(255, BroadcastAddress.SLEEPY, Zcl.Clusters.ssIasZone.ID, 'boschSmokeDetectorSiren', {data: 0x0000}, options);
+        const sentFrame = mockZclFrame.create(
+            Zcl.FrameType.SPECIFIC,
+            Zcl.Direction.CLIENT_TO_SERVER,
+            true,
+            Zcl.ManufacturerCode.ROBERT_BOSCH_GMBH,
+            // @ts-expect-error private
+            ZclTransactionSequenceNumber.number,
+            'boschSmokeDetectorSiren',
+            Zcl.Clusters.ssIasZone.ID,
+            {data: 0x0000},
+            device.customClusters
+        );
+        expect(mocksendZclFrameToAll.mock.calls[0][0]).toBe(255);
+        expect(deepClone(mocksendZclFrameToAll.mock.calls[0][1])).toStrictEqual(deepClone(sentFrame));
+        expect(mocksendZclFrameToAll.mock.calls[0][2]).toBe(1);
+        expect(mocksendZclFrameToAll.mock.calls[0][3]).toBe(BroadcastAddress.SLEEPY);
+        expect(mocksendZclFrameToAll).toHaveBeenCalledTimes(1);
     });
 
     it('Should roll-over transaction ID', async () => {
@@ -2283,11 +2558,11 @@ describe('Controller', () => {
         for (let i = 0; i < 300; i++) {
             await endpoint.read('genBasic', ['modelId']);
         }
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(300);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(300);
 
         const ids = [];
         for (let i = 0; i < 300; i++) {
-            ids.push(mocksendZclFrameToEndpoint.mock.calls[i][3].Header.transactionSequenceNumber);
+            ids.push(mocksendZclFrameToEndpoint.mock.calls[i][3].header.transactionSequenceNumber);
         }
 
         expect(ids.includes(255)).toBeTruthy();
@@ -2341,8 +2616,8 @@ describe('Controller', () => {
         await mockAdapterEvents['deviceJoined']({networkAddress: 140, ieeeAddr: '0x140'});
         const device = controller.getDeviceByIeeeAddr('0x140');
         await device.removeFromNetwork();
-        expect(mockAdapterRemoveDevice).toBeCalledTimes(1);
-        expect(mockAdapterRemoveDevice).toBeCalledWith(140, '0x140');
+        expect(mockAdapterRemoveDevice).toHaveBeenCalledTimes(1);
+        expect(mockAdapterRemoveDevice).toHaveBeenCalledWith(140, '0x140');
         expect(controller.getDeviceByIeeeAddr('0x140')).toBeUndefined();
         // shouldn't throw when removing from database when not in
         await device.removeFromDatabase();
@@ -2364,7 +2639,7 @@ describe('Controller', () => {
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":12,"manufacturerCode":null,"commandIdentifier":3},"Payload":{"groupid":4},"Cluster":{"ID":4,"attributes":{"nameSupport":{"ID":0,"type":24,"name":"nameSupport"}},"name":"genGroups","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"},"view":{"ID":1,"parameters":[{"name":"groupid","type":33}],"name":"view"},"getMembership":{"ID":2,"response":2,"parameters":[{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembership"},"miboxerSetZones":{"ID":240,"name":"miboxerSetZones","parameters":[{"name":"zones","type":1012}]},"remove":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"},"removeAll":{"ID":4,"parameters":[],"name":"removeAll"},"addIfIdentifying":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"addIfIdentifying"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"viewRsp"},"getMembershipRsp":{"ID":2,"parameters":[{"name":"capacity","type":32},{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembershipRsp"},"removeRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeRsp"}}},"Command":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":12,"manufacturerCode":null,"commandIdentifier":3},"payload":{"groupid":4},"cluster":{"ID":4,"attributes":{"nameSupport":{"ID":0,"type":24,"name":"nameSupport"}},"name":"genGroups","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"},"view":{"ID":1,"parameters":[{"name":"groupid","type":33}],"name":"view"},"getMembership":{"ID":2,"response":2,"parameters":[{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembership"},"miboxerSetZones":{"ID":240,"name":"miboxerSetZones","parameters":[{"name":"zones","type":1012}]},"remove":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"},"removeAll":{"ID":4,"parameters":[],"name":"removeAll"},"addIfIdentifying":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"addIfIdentifying"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"viewRsp"},"getMembershipRsp":{"ID":2,"parameters":[{"name":"capacity","type":32},{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembershipRsp"},"removeRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeRsp"}}},"command":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"}});
     });
 
     it('Remove group from database', async () => {
@@ -2404,12 +2679,12 @@ describe('Controller', () => {
         const device = controller.getDeviceByIeeeAddr('0x176');
         mocksendZclFrameToEndpoint.mockClear();
         const result = await device.ping();
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x176');
         expect(call[1]).toBe(176);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":2,"manufacturerCode":null,"commandIdentifier":0},"Payload":[{"attrId":0}],"Cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"Command":{"ID":0,"name":"read","parameters":[{"name":"attrId","type":33}],"response":1}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":2,"manufacturerCode":null,"commandIdentifier":0},"payload":[{"attrId":0}],"cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"command":{"ID":0,"name":"read","parameters":[{"name":"attrId","type":33}],"response":1}});
         expect(call[4]).toBe(10000);
         expect(call[5]).toBe(false);
         expect(call[6]).toBe(true);
@@ -2431,16 +2706,18 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockClear();
         mocksendZclFrameToEndpoint.mockReturnValueOnce (null);
         mocksendZclFrameToEndpoint.mockImplementationOnce((ieeeAddr, networkAddress, endpoint, frame: ZclFrame) => {
-            const payload = [];
-            payload.push({"attrId":0,"status":0,"dataType":35,"attrData":204});
-            return {frame: new ZclFrame(null, payload, frame.Cluster)};
+            const payload = [{"attrId":0,"status":0,"dataType":35,"attrData":204}];
+            const responseFrame = mockZclFrame.create(0, 1, true, null, 10, 'readRsp', frame.cluster.ID, payload);
+            return {header: responseFrame.header, data: responseFrame.toBuffer(), clusterID: frame.cluster.ID};
         });
         mocksendZclFrameToEndpoint.mockImplementationOnce (() => jest.advanceTimersByTime(10));
-
-        await mockAdapterEvents['zclData']({
+        let frame = Zcl.Frame.create(Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, true, 1, 1, 'checkin', Zcl.Utils.getCluster("genPollCtrl").ID, {}, 0);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 174,
-            frame: ZclFrame.create(Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, true, 1, 1, 'checkin', Zcl.Utils.getCluster("genPollCtrl").ID, {}, 0),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 52,
             groupID: undefined,
@@ -2452,10 +2729,13 @@ describe('Controller', () => {
         device._checkinInterval = 50;
 
         mocksendZclFrameToEndpoint.mockClear();
-        await mockAdapterEvents['zclData']({
+        frame = Zcl.Frame.create(Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, true, 1, 1, 'checkin', Zcl.Utils.getCluster("genPollCtrl").ID, {}, 0);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 174,
-            frame: ZclFrame.create(Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, true, 1, 1, 'checkin', Zcl.Utils.getCluster("genPollCtrl").ID, {}, 0),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 52,
             groupID: undefined,
@@ -2464,9 +2744,9 @@ describe('Controller', () => {
         expect(call[0]).toBe('0x174');
         expect(call[1]).toBe(174);
         expect(call[2]).toBe(1);
-        expect(call[3].Cluster.name).toBe('genPollCtrl');
-        expect(call[3].Command.name).toBe('checkinRsp');
-        expect(call[3].Payload).toStrictEqual({startFastPolling: false, fastPollTimeout: 0});
+        expect(call[3].cluster.name).toBe('genPollCtrl');
+        expect(call[3].command.name).toBe('checkinRsp');
+        expect(call[3].payload).toStrictEqual({startFastPolling: false, fastPollTimeout: 0});
     });
 
     it('Poll control unsupported', async () => {
@@ -2504,13 +2784,13 @@ describe('Controller', () => {
         const endpoint = device.getEndpoint(1);
         await endpoint.bind('genBasic', target);
         expect(deepClone(endpoint.binds)).toStrictEqual(deepClone([{cluster: Zcl.Utils.getCluster(0), target}]));
-        expect(mockAdapterBind).toBeCalledWith(129, "0x129", 1, 0, "0x170", "endpoint", 1);
+        expect(mockAdapterBind).toHaveBeenCalledWith(129, "0x129", 1, 0, "0x170", "endpoint", 1);
 
         // Should bind another time but not add it to the binds
         mockAdapterBind.mockClear();
         await endpoint.bind('genBasic', target);
         expect(deepClone(endpoint.binds)).toStrictEqual(deepClone([{cluster: Zcl.Utils.getCluster(0), target}]));
-        expect(mockAdapterBind).toBeCalledWith(129, "0x129", 1, 0, "0x170", "endpoint", 1);
+        expect(mockAdapterBind).toHaveBeenCalledWith(129, "0x129", 1, 0, "0x170", "endpoint", 1);
     });
 
     it('Endpoint addBinding', async () => {
@@ -2545,7 +2825,7 @@ describe('Controller', () => {
         const endpoint = device.getEndpoint(1);
         await endpoint.bind('genPowerCfg', group);
         expect(deepClone(endpoint.binds)).toStrictEqual(deepClone([{cluster: Zcl.Utils.getCluster(1), target: group}]));
-        expect(mockAdapterBind).toBeCalledWith(129, "0x129", 1, 1, 4, "group", null);
+        expect(mockAdapterBind).toHaveBeenCalledWith(129, "0x129", 1, 1, 4, "group", null);
     });
 
     it('Group addBinding', async () => {
@@ -2567,7 +2847,7 @@ describe('Controller', () => {
         await endpoint.bind('genPowerCfg', 11);
         const group = Group.byGroupID(11);
         expect(deepClone(endpoint.binds)).toStrictEqual(deepClone([{cluster: Zcl.Utils.getCluster(1), target: group}]));
-        expect(mockAdapterBind).toBeCalledWith(129, "0x129", 1, 1, 11, "group", null);
+        expect(mockAdapterBind).toHaveBeenCalledWith(129, "0x129", 1, 1, 11, "group", null);
     });
 
     it('Group addBinding by number (should create group)', async () => {
@@ -2592,13 +2872,13 @@ describe('Controller', () => {
         mockAdapterBind.mockClear();
         await endpoint.unbind('genBasic', target);
         expect(endpoint.binds).toStrictEqual([]);
-        expect(mockAdapterUnbind).toBeCalledWith(129, "0x129", 1, 0, "0x170", "endpoint", 1);
+        expect(mockAdapterUnbind).toHaveBeenCalledWith(129, "0x129", 1, 0, "0x170", "endpoint", 1);
 
         // Should unbind another time when not in binds
         mockAdapterBind.mockClear();
         await endpoint.unbind('genBasic', target);
         expect(endpoint.binds).toStrictEqual([]);
-        expect(mockAdapterUnbind).toBeCalledWith(129, "0x129", 1, 0, "0x170", "endpoint", 1);
+        expect(mockAdapterUnbind).toHaveBeenCalledWith(129, "0x129", 1, 0, "0x170", "endpoint", 1);
     });
 
     it('Group unbind', async () => {
@@ -2611,7 +2891,7 @@ describe('Controller', () => {
         await endpoint.bind('genPowerCfg', group);
         expect(endpoint.binds.length).toBe(1);
         await endpoint.unbind('genPowerCfg', group);
-        expect(mockAdapterUnbind).toBeCalledWith(129, "0x129", 1, 1, 5, "group", null);
+        expect(mockAdapterUnbind).toHaveBeenCalledWith(129, "0x129", 1, 1, 5, "group", null);
         expect(endpoint.binds.length).toBe(0);
     });
 
@@ -2625,7 +2905,7 @@ describe('Controller', () => {
         await endpoint.bind('genPowerCfg', group);
         expect(endpoint.binds.length).toBe(1);
         await endpoint.unbind('genPowerCfg', 5);
-        expect(mockAdapterUnbind).toBeCalledWith(129, "0x129", 1, 1, 5, "group", null);
+        expect(mockAdapterUnbind).toHaveBeenCalledWith(129, "0x129", 1, 1, 5, "group", null);
         expect(endpoint.binds.length).toBe(0);
     });
 
@@ -2646,7 +2926,7 @@ describe('Controller', () => {
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1)
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":6},"Payload":[{"direction":0,"attrId":1,"dataType":32,"minRepIntval":1,"maxRepIntval":10,"repChange":1}],"Cluster":{"ID":1,"attributes":{"mainsVoltage":{"ID":0,"type":33,"name":"mainsVoltage"},"mainsFrequency":{"ID":1,"type":32,"name":"mainsFrequency"},"mainsAlarmMask":{"ID":16,"type":24,"name":"mainsAlarmMask"},"mainsVoltMinThres":{"ID":17,"type":33,"name":"mainsVoltMinThres"},"mainsVoltMaxThres":{"ID":18,"type":33,"name":"mainsVoltMaxThres"},"mainsVoltageDwellTripPoint":{"ID":19,"type":33,"name":"mainsVoltageDwellTripPoint"},"batteryVoltage":{"ID":32,"type":32,"name":"batteryVoltage"},"batteryPercentageRemaining":{"ID":33,"type":32,"name":"batteryPercentageRemaining"},"batteryManufacturer":{"ID":48,"type":66,"name":"batteryManufacturer"},"batterySize":{"ID":49,"type":48,"name":"batterySize"},"batteryAHrRating":{"ID":50,"type":33,"name":"batteryAHrRating"},"batteryQuantity":{"ID":51,"type":32,"name":"batteryQuantity"},"batteryRatedVoltage":{"ID":52,"type":32,"name":"batteryRatedVoltage"},"batteryAlarmMask":{"ID":53,"type":24,"name":"batteryAlarmMask"},"batteryVoltMinThres":{"ID":54,"type":32,"name":"batteryVoltMinThres"},"batteryVoltThres1":{"ID":55,"type":32,"name":"batteryVoltThres1"},"batteryVoltThres2":{"ID":56,"type":32,"name":"batteryVoltThres2"},"batteryVoltThres3":{"ID":57,"type":32,"name":"batteryVoltThres3"},"batteryPercentMinThres":{"ID":58,"type":32,"name":"batteryPercentMinThres"},"batteryPercentThres1":{"ID":59,"type":32,"name":"batteryPercentThres1"},"batteryPercentThres2":{"ID":60,"type":32,"name":"batteryPercentThres2"},"batteryPercentThres3":{"ID":61,"type":32,"name":"batteryPercentThres3"},"batteryAlarmState":{"ID":62,"type":27,"name":"batteryAlarmState"}},"name":"genPowerCfg","commands":{},"commandsResponse":{}},"Command":{"ID":6,"name":"configReport","parameters":[{"name":"direction","type":32},{"name":"attrId","type":33},{"name":"dataType","type":32,"conditions":[{"type":"directionEquals","value":0}]},{"name":"minRepIntval","type":33,"conditions":[{"type":"directionEquals","value":0}]},{"name":"maxRepIntval","type":33,"conditions":[{"type":"directionEquals","value":0}]},{"name":"repChange","type":1000,"conditions":[{"type":"directionEquals","value":0},{"type":"dataTypeValueTypeEquals","value":"ANALOG"}]},{"name":"timeout","type":33,"conditions":[{"type":"directionEquals","value":1}]}],"response":7}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":6},"payload":[{"direction":0,"attrId":1,"dataType":32,"minRepIntval":1,"maxRepIntval":10,"repChange":1}],"cluster":{"ID":1,"attributes":{"mainsVoltage":{"ID":0,"type":33,"name":"mainsVoltage"},"mainsFrequency":{"ID":1,"type":32,"name":"mainsFrequency"},"mainsAlarmMask":{"ID":16,"type":24,"name":"mainsAlarmMask"},"mainsVoltMinThres":{"ID":17,"type":33,"name":"mainsVoltMinThres"},"mainsVoltMaxThres":{"ID":18,"type":33,"name":"mainsVoltMaxThres"},"mainsVoltageDwellTripPoint":{"ID":19,"type":33,"name":"mainsVoltageDwellTripPoint"},"batteryVoltage":{"ID":32,"type":32,"name":"batteryVoltage"},"batteryPercentageRemaining":{"ID":33,"type":32,"name":"batteryPercentageRemaining"},"batteryManufacturer":{"ID":48,"type":66,"name":"batteryManufacturer"},"batterySize":{"ID":49,"type":48,"name":"batterySize"},"batteryAHrRating":{"ID":50,"type":33,"name":"batteryAHrRating"},"batteryQuantity":{"ID":51,"type":32,"name":"batteryQuantity"},"batteryRatedVoltage":{"ID":52,"type":32,"name":"batteryRatedVoltage"},"batteryAlarmMask":{"ID":53,"type":24,"name":"batteryAlarmMask"},"batteryVoltMinThres":{"ID":54,"type":32,"name":"batteryVoltMinThres"},"batteryVoltThres1":{"ID":55,"type":32,"name":"batteryVoltThres1"},"batteryVoltThres2":{"ID":56,"type":32,"name":"batteryVoltThres2"},"batteryVoltThres3":{"ID":57,"type":32,"name":"batteryVoltThres3"},"batteryPercentMinThres":{"ID":58,"type":32,"name":"batteryPercentMinThres"},"batteryPercentThres1":{"ID":59,"type":32,"name":"batteryPercentThres1"},"batteryPercentThres2":{"ID":60,"type":32,"name":"batteryPercentThres2"},"batteryPercentThres3":{"ID":61,"type":32,"name":"batteryPercentThres3"},"batteryAlarmState":{"ID":62,"type":27,"name":"batteryAlarmState"}},"name":"genPowerCfg","commands":{},"commandsResponse":{}},"command":{"ID":6,"name":"configReport","parameters":[{"name":"direction","type":32},{"name":"attrId","type":33},{"name":"dataType","type":32,"conditions":[{"type":"directionEquals","value":0}]},{"name":"minRepIntval","type":33,"conditions":[{"type":"directionEquals","value":0}]},{"name":"maxRepIntval","type":33,"conditions":[{"type":"directionEquals","value":0}]},{"name":"repChange","type":1000,"conditions":[{"type":"directionEquals","value":0},{"type":"dataTypeValueTypeEquals","value":"ANALOG"}]},{"name":"timeout","type":33,"conditions":[{"type":"directionEquals","value":1}]}],"response":7}});
     });
 
     it('Should replace legacy configured reportings without manufacturerCode', async () => {
@@ -2688,7 +2968,7 @@ describe('Controller', () => {
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1)
-        expect({...deepClone(call[3]), Cluster: {}}).toStrictEqual({"Cluster":{},"Command":{"ID":6,"name":"configReport","parameters":[{"name":"direction","type":32},{"name":"attrId","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"dataType","type":32},{"conditions":[{"type":"directionEquals","value":0}],"name":"minRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"maxRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0},{"type":"dataTypeValueTypeEquals","value":"ANALOG"}],"name":"repChange","type":1000},{"conditions":[{"type":"directionEquals","value":1}],"name":"timeout","type":33}],"response":7},"Header":{"commandIdentifier":6,"frameControl":{"direction":0,"disableDefaultResponse":true,"frameType":0,"manufacturerSpecific":true,"reservedBits":0},"manufacturerCode":4641,"transactionSequenceNumber":11},"Payload":[{"attrId":16384,"dataType":48,"direction":0,"maxRepIntval":10,"minRepIntval":1,"repChange":1}]});
+        expect({...deepClone(call[3]), cluster: {}}).toStrictEqual({"cluster":{},"command":{"ID":6,"name":"configReport","parameters":[{"name":"direction","type":32},{"name":"attrId","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"dataType","type":32},{"conditions":[{"type":"directionEquals","value":0}],"name":"minRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"maxRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0},{"type":"dataTypeValueTypeEquals","value":"ANALOG"}],"name":"repChange","type":1000},{"conditions":[{"type":"directionEquals","value":1}],"name":"timeout","type":33}],"response":7},"header":{"commandIdentifier":6,"frameControl":{"direction":0,"disableDefaultResponse":true,"frameType":0,"manufacturerSpecific":true,"reservedBits":0},"manufacturerCode":4641,"transactionSequenceNumber":11},"payload":[{"attrId":16384,"dataType":48,"direction":0,"maxRepIntval":10,"minRepIntval":1,"repChange":1}]});
 
         expect(endpoint.configuredReportings.length).toBe(1);
         expect({...endpoint.configuredReportings[0], cluster: undefined}).toStrictEqual({"attribute":{"ID":16384,"type":48,"manufacturerCode":4641,"name":"viessmannWindowOpenInternal"},"minimumReportInterval":1,"maximumReportInterval":10,"reportableChange":1, "cluster": undefined});
@@ -2702,7 +2982,7 @@ describe('Controller', () => {
         const endpoint = device.getEndpoint(1);
         mocksendZclFrameToEndpoint.mockClear();
         await endpoint.configureReporting('hvacThermostat', [{
-            attribute: 'ubisysVacationMode',
+            attribute: 'viessmannWindowOpenInternal',
             minimumReportInterval: 1,
             maximumReportInterval: 10,
             reportableChange: 1,
@@ -2712,10 +2992,10 @@ describe('Controller', () => {
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1)
-        expect({...deepClone(call[3]), Cluster: {}}).toStrictEqual({"Cluster":{},"Command":{"ID":6,"name":"configReport","parameters":[{"name":"direction","type":32},{"name":"attrId","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"dataType","type":32},{"conditions":[{"type":"directionEquals","value":0}],"name":"minRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"maxRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0},{"type":"dataTypeValueTypeEquals","value":"ANALOG"}],"name":"repChange","type":1000},{"conditions":[{"type":"directionEquals","value":1}],"name":"timeout","type":33}],"response":7},"Header":{"commandIdentifier":6,"frameControl":{"direction":0,"disableDefaultResponse":true,"frameType":0,"manufacturerSpecific":true,"reservedBits":0},"manufacturerCode":4338,"transactionSequenceNumber":11},"Payload":[{"attrId":18,"dataType":16,"direction":0,"maxRepIntval":10,"minRepIntval":1,"repChange":1}]});
+        expect({...deepClone(call[3]), cluster: {}}).toStrictEqual({"cluster":{},"command":{"ID":6,"name":"configReport","parameters":[{"name":"direction","type":32},{"name":"attrId","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"dataType","type":32},{"conditions":[{"type":"directionEquals","value":0}],"name":"minRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"maxRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0},{"type":"dataTypeValueTypeEquals","value":"ANALOG"}],"name":"repChange","type":1000},{"conditions":[{"type":"directionEquals","value":1}],"name":"timeout","type":33}],"response":7},"header":{"commandIdentifier":6,"frameControl":{"direction":0,"disableDefaultResponse":true,"frameType":0,"manufacturerSpecific":true,"reservedBits":0},"manufacturerCode":4641,"transactionSequenceNumber":11},"payload":[{"attrId":16384,"dataType":48,"direction":0,"maxRepIntval":10,"minRepIntval":1,"repChange":1}]});
 
         expect(endpoint.configuredReportings.length).toBe(1);
-        expect({...endpoint.configuredReportings[0], cluster: undefined}).toStrictEqual({"attribute":{"ID":18,"type":16,"manufacturerCode":4338,"name":"ubisysVacationMode"},"minimumReportInterval":1,"maximumReportInterval":10,"reportableChange":1, "cluster": undefined});
+        expect({...endpoint.configuredReportings[0], cluster: undefined}).toStrictEqual({"attribute":{"ID":16384,"type":48,"manufacturerCode":4641,"name":"viessmannWindowOpenInternal"},"minimumReportInterval":1,"maximumReportInterval":10,"reportableChange":1, "cluster": undefined});
     });
 
     it('Endpoint configure reporting with manufacturer attribute should throw exception', async () => {
@@ -2735,7 +3015,7 @@ describe('Controller', () => {
                     reportableChange: 1,
                 },
                 {
-                    attribute: 'ubisysRemoteTemperature',
+                    attribute: 'viessmannWindowOpenInternal',
                     minimumReportInterval: 1,
                     maximumReportInterval: 10,
                     reportableChange: 1,
@@ -2802,8 +3082,8 @@ describe('Controller', () => {
         catch (e) {
             error = e;
         }
-        expect(error instanceof Zcl.ZclStatusError).toBeTruthy();
-        expect(error.message).toStrictEqual(`ConfigureReporting 0x129/1 genPowerCfg([{"attribute":"mainsFrequency","minimumReportInterval":1,"maximumReportInterval":10,"reportableChange":1}], {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (Status 'FAILURE')`);
+        expect(error instanceof Zcl.StatusError).toBeTruthy();
+        expect(error.message).toStrictEqual(`ZCL command 0x129/1 genPowerCfg.configReport([{\"attribute\":\"mainsFrequency\",\"minimumReportInterval\":1,\"maximumReportInterval\":10,\"reportableChange\":1}], {\"timeout\":10000,\"disableResponse\":false,\"disableRecovery\":false,\"disableDefaultResponse\":true,\"direction\":0,\"srcEndpoint\":null,\"reservedBits\":0,\"manufacturerCode\":null,\"transactionSequenceNumber\":null,\"writeUndiv\":false}) failed (Status 'FAILURE')`);
         expect(error.code).toBe(1);
     });
 
@@ -2827,8 +3107,8 @@ describe('Controller', () => {
         catch (e) {
             error = e;
         }
-        expect(error instanceof Zcl.ZclStatusError).toBeTruthy();
-        expect(error.message).toStrictEqual(`ConfigureReporting 0x129/1 genPowerCfg([{"attribute":"mainsFrequency","minimumReportInterval":1,"maximumReportInterval":10,"reportableChange":1}], {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (Status 'FAILURE')`);
+        expect(error instanceof Zcl.StatusError).toBeTruthy();
+        expect(error.message).toStrictEqual(`ZCL command 0x129/1 genPowerCfg.configReport([{\"attribute\":\"mainsFrequency\",\"minimumReportInterval\":1,\"maximumReportInterval\":10,\"reportableChange\":1}], {\"timeout\":10000,\"disableResponse\":false,\"disableRecovery\":false,\"disableDefaultResponse\":true,\"direction\":0,\"srcEndpoint\":null,\"reservedBits\":0,\"manufacturerCode\":null,\"transactionSequenceNumber\":null,\"writeUndiv\":false}) failed (Status 'FAILURE')`);
         expect(error.code).toBe(1);
     });
 
@@ -2881,9 +3161,9 @@ describe('Controller', () => {
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":0},"Payload":{"groupid":2,"groupname":""},"Cluster":{"ID":4,"attributes":{"nameSupport":{"ID":0,"type":24,"name":"nameSupport"}},"name":"genGroups","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"},"view":{"ID":1,"parameters":[{"name":"groupid","type":33}],"name":"view"},"getMembership":{"ID":2,"response":2,"parameters":[{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembership"},"miboxerSetZones":{"ID":240,"name":"miboxerSetZones","parameters":[{"name":"zones","type":1012}]},"remove":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"},"removeAll":{"ID":4,"parameters":[],"name":"removeAll"},"addIfIdentifying":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"addIfIdentifying"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"viewRsp"},"getMembershipRsp":{"ID":2,"parameters":[{"name":"capacity","type":32},{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembershipRsp"},"removeRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeRsp"}}},"Command":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":0},"payload":{"groupid":2,"groupname":""},"cluster":{"ID":4,"attributes":{"nameSupport":{"ID":0,"type":24,"name":"nameSupport"}},"name":"genGroups","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"},"view":{"ID":1,"parameters":[{"name":"groupid","type":33}],"name":"view"},"getMembership":{"ID":2,"response":2,"parameters":[{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembership"},"miboxerSetZones":{"ID":240,"name":"miboxerSetZones","parameters":[{"name":"zones","type":1012}]},"remove":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"},"removeAll":{"ID":4,"parameters":[],"name":"removeAll"},"addIfIdentifying":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"addIfIdentifying"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"viewRsp"},"getMembershipRsp":{"ID":2,"parameters":[{"name":"capacity","type":32},{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembershipRsp"},"removeRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeRsp"}}},"command":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"}});
         expect(group.members).toContain(endpoint);
-        expect(databaseContents()).toContain(`{"id":1,"type":"Coordinator","ieeeAddr":"0x123","nwkAddr":123,"manufId":100,"epList":[1,2],"endpoints":{"1":{"profId":2,"epId":1,"devId":3,"inClusterList":[10],"outClusterList":[11],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}},"2":{"profId":3,"epId":2,"devId":5,"inClusterList":[1],"outClusterList":[0],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}}},"interviewCompleted":true,"meta":{},"lastSeen":null}\n{"id":2,"type":"Router","ieeeAddr":"0x129","nwkAddr":129,"manufId":1212,"manufName":"KoenAndCo","powerSource":"Mains (single phase)","modelId":"myModelID","epList":[1],"endpoints":{"1":{"profId":99,"epId":1,"devId":5,"inClusterList":[0,1],"outClusterList":[2],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}}},"appVersion":2,"stackVersion":101,"hwVersion":3,"dateCode":"201901","swBuildId":"1.01","zclVersion":1,"interviewCompleted":true,"meta":{},"lastSeen":150}\n{"id":3,"type":"Group","groupID":2,"members":[{"deviceIeeeAddr":"0x129","endpointID":1}],"meta":{}}`);
+        expect(databaseContents()).toContain(`{"id":1,"type":"Coordinator","ieeeAddr":"0x0000012300000000","nwkAddr":123,"manufId":100,"epList":[1,2],"endpoints":{"1":{"profId":2,"epId":1,"devId":3,"inClusterList":[10],"outClusterList":[11],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}},"2":{"profId":3,"epId":2,"devId":5,"inClusterList":[1],"outClusterList":[0],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}}},"interviewCompleted":true,"meta":{},"lastSeen":null}\n{"id":2,"type":"Router","ieeeAddr":"0x129","nwkAddr":129,"manufId":1212,"manufName":"KoenAndCo","powerSource":"Mains (single phase)","modelId":"myModelID","epList":[1],"endpoints":{"1":{"profId":99,"epId":1,"devId":5,"inClusterList":[0,1],"outClusterList":[2],"clusters":{},"binds":[],"configuredReportings":[],"meta":{}}},"appVersion":2,"stackVersion":101,"hwVersion":3,"dateCode":"201901","swBuildId":"1.01","zclVersion":1,"interviewCompleted":true,"meta":{},"lastSeen":150}\n{"id":3,"type":"Group","groupID":2,"members":[{"deviceIeeeAddr":"0x129","endpointID":1}],"meta":{}}`);
     });
 
     it('Remove endpoint from group', async () => {
@@ -2899,7 +3179,7 @@ describe('Controller', () => {
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":3},"Payload":{"groupid":2},"Cluster":{"ID":4,"attributes":{"nameSupport":{"ID":0,"type":24,"name":"nameSupport"}},"name":"genGroups","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"},"view":{"ID":1,"parameters":[{"name":"groupid","type":33}],"name":"view"},"getMembership":{"ID":2,"response":2,"parameters":[{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembership"},"miboxerSetZones":{"ID":240,"name":"miboxerSetZones","parameters":[{"name":"zones","type":1012}]},"remove":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"},"removeAll":{"ID":4,"parameters":[],"name":"removeAll"},"addIfIdentifying":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"addIfIdentifying"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"viewRsp"},"getMembershipRsp":{"ID":2,"parameters":[{"name":"capacity","type":32},{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembershipRsp"},"removeRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeRsp"}}},"Command":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":3},"payload":{"groupid":2},"cluster":{"ID":4,"attributes":{"nameSupport":{"ID":0,"type":24,"name":"nameSupport"}},"name":"genGroups","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"},"view":{"ID":1,"parameters":[{"name":"groupid","type":33}],"name":"view"},"getMembership":{"ID":2,"response":2,"parameters":[{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembership"},"miboxerSetZones":{"ID":240,"name":"miboxerSetZones","parameters":[{"name":"zones","type":1012}]},"remove":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"},"removeAll":{"ID":4,"parameters":[],"name":"removeAll"},"addIfIdentifying":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"addIfIdentifying"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"viewRsp"},"getMembershipRsp":{"ID":2,"parameters":[{"name":"capacity","type":32},{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembershipRsp"},"removeRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeRsp"}}},"command":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"}});
         expect(group.members).toStrictEqual([]);
     });
 
@@ -2914,7 +3194,16 @@ describe('Controller', () => {
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":3},"Payload":{"groupid":4},"Cluster":{"ID":4,"attributes":{"nameSupport":{"ID":0,"type":24,"name":"nameSupport"}},"name":"genGroups","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"},"view":{"ID":1,"parameters":[{"name":"groupid","type":33}],"name":"view"},"getMembership":{"ID":2,"response":2,"parameters":[{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembership"},"miboxerSetZones":{"ID":240,"name":"miboxerSetZones","parameters":[{"name":"zones","type":1012}]},"remove":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"},"removeAll":{"ID":4,"parameters":[],"name":"removeAll"},"addIfIdentifying":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"addIfIdentifying"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"viewRsp"},"getMembershipRsp":{"ID":2,"parameters":[{"name":"capacity","type":32},{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembershipRsp"},"removeRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeRsp"}}},"Command":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":3},"payload":{"groupid":4},"cluster":{"ID":4,"attributes":{"nameSupport":{"ID":0,"type":24,"name":"nameSupport"}},"name":"genGroups","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"},"view":{"ID":1,"parameters":[{"name":"groupid","type":33}],"name":"view"},"getMembership":{"ID":2,"response":2,"parameters":[{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembership"},"miboxerSetZones":{"ID":240,"name":"miboxerSetZones","parameters":[{"name":"zones","type":1012}]},"remove":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"},"removeAll":{"ID":4,"parameters":[],"name":"removeAll"},"addIfIdentifying":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"addIfIdentifying"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"viewRsp"},"getMembershipRsp":{"ID":2,"parameters":[{"name":"capacity","type":32},{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembershipRsp"},"removeRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeRsp"}}},"command":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"}});
+    });
+
+    it('Command response', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        const endpoint = device.getEndpoint(1);
+        const response = await endpoint.command('genGroups', 'add', {groupid: 1, groupname: ''});
+        expect(response).toStrictEqual({groupid: 1, status: 0});
     });
 
     it('Group command', async () => {
@@ -2923,7 +3212,7 @@ describe('Controller', () => {
         await group.command('genOnOff', 'offWithEffect', {effectid: 9, effectvariant: 10});
         const call = mocksendZclFrameToGroup.mock.calls[0];
         expect(call[0]).toBe(2);
-        expect({...deepClone(call[1]), Cluster: null}).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":2,"manufacturerCode":null,"commandIdentifier":64},"Payload":{"effectid":9,"effectvariant":10},"Cluster": null, "Command":{"ID":64,"parameters":[{"name":"effectid","type":32},{"name":"effectvariant","type":32}],"name":"offWithEffect"}});
+        expect({...deepClone(call[1]), cluster: null}).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":2,"manufacturerCode":null,"commandIdentifier":64},"payload":{"effectid":9,"effectvariant":10},"cluster": null, "command":{"ID":64,"parameters":[{"name":"effectid","type":32},{"name":"effectvariant","type":32}],"name":"offWithEffect"}});
     });
 
     it('Endpoint command with options', async () => {
@@ -2936,7 +3225,7 @@ describe('Controller', () => {
         expect(mocksendZclFrameToEndpoint.mock.calls[0][0]).toBe('0x129');
         expect(mocksendZclFrameToEndpoint.mock.calls[0][1]).toBe(129);
         expect(mocksendZclFrameToEndpoint.mock.calls[0][2]).toBe(1);
-        expect({...deepClone(mocksendZclFrameToEndpoint.mock.calls[0][3]), Cluster: null}).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":100,"commandIdentifier":0},"Payload":{},"Cluster": null,"Command":{"ID":0,"parameters":[],"name":"off"}});
+        expect({...deepClone(mocksendZclFrameToEndpoint.mock.calls[0][3]), cluster: null}).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":100,"commandIdentifier":0},"payload":{},"cluster": null,"command":{"ID":0,"parameters":[],"name":"off"}});
         expect(mocksendZclFrameToEndpoint.mock.calls[0][4]).toBe(10000);
         expect(mocksendZclFrameToEndpoint.mock.calls[0][5]).toBe(false);
         expect(mocksendZclFrameToEndpoint.mock.calls[0][6]).toBe(false);
@@ -2979,7 +3268,7 @@ describe('Controller', () => {
         expect(mocksendZclFrameToEndpoint.mock.calls[0][0]).toBe('0x129');
         expect(mocksendZclFrameToEndpoint.mock.calls[0][1]).toBe(129);
         expect(mocksendZclFrameToEndpoint.mock.calls[0][2]).toBe(1);
-        const expected = {"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":0},"Payload":{"payloadType":0,"queryJitter":1},"Cluster":{"ID":25,"attributes":{"upgradeServerId":{"ID":0,"type":240,"name":"upgradeServerId"},"fileOffset":{"ID":1,"type":35,"name":"fileOffset"},"currentFileVersion":{"ID":2,"type":35,"name":"currentFileVersion"},"currentZigbeeStackVersion":{"ID":3,"type":33,"name":"currentZigbeeStackVersion"},"downloadedFileVersion":{"ID":4,"type":35,"name":"downloadedFileVersion"},"downloadedZigbeeStackVersion":{"ID":5,"type":33,"name":"downloadedZigbeeStackVersion"},"imageUpgradeStatus":{"ID":6,"type":48,"name":"imageUpgradeStatus"},"manufacturerId":{"ID":7,"type":33,"name":"manufacturerId"},"imageTypeId":{"ID":8,"type":33,"name":"imageTypeId"},"minimumBlockReqDelay":{"ID":9,"type":33,"name":"minimumBlockReqDelay"},"imageStamp":{"ID":10,"type":35,"name":"imageStamp"}},"name":"genOta","commands":{"queryNextImageRequest":{"ID":1,"response":2,"parameters":[{"name":"fieldControl","type":32},{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35}],"name":"queryNextImageRequest"},"imageBlockRequest":{"ID":3,"response":5,"parameters":[{"name":"fieldControl","type":32},{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35},{"name":"fileOffset","type":35},{"name":"maximumDataSize","type":32}],"name":"imageBlockRequest"},"imagePageRequest":{"ID":4,"response":5,"parameters":[{"name":"fieldControl","type":32},{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35},{"name":"fileOffset","type":35},{"name":"maximumDataSize","type":32},{"name":"pageSize","type":33},{"name":"responseSpacing","type":33}],"name":"imagePageRequest"},"upgradeEndRequest":{"ID":6,"response":7,"parameters":[{"name":"status","type":32},{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35}],"name":"upgradeEndRequest"}},"commandsResponse":{"imageNotify":{"ID":0,"parameters":[{"name":"payloadType","type":32},{"name":"queryJitter","type":32}],"name":"imageNotify"},"queryNextImageResponse":{"ID":2,"parameters":[{"name":"status","type":32},{"name":"manufacturerCode","type":33,"conditions":[{"type":"statusEquals","value":0}]},{"name":"imageType","type":33,"conditions":[{"type":"statusEquals","value":0}]},{"name":"fileVersion","type":35,"conditions":[{"type":"statusEquals","value":0}]},{"name":"imageSize","type":35,"conditions":[{"type":"statusEquals","value":0}]}],"name":"queryNextImageResponse"},"imageBlockResponse":{"ID":5,"parameters":[{"name":"status","type":32},{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35},{"name":"fileOffset","type":35},{"name":"dataSize","type":32},{"name":"data","type":1008}],"name":"imageBlockResponse"},"upgradeEndResponse":{"ID":7,"parameters":[{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35},{"name":"currentTime","type":35},{"name":"upgradeTime","type":35}],"name":"upgradeEndResponse"}}},"Command":{"ID":0,"parameters":[{"name":"payloadType","type":32},{"name":"queryJitter","type":32}],"name":"imageNotify"}};
+        const expected = {"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":0},"payload":{"payloadType":0,"queryJitter":1},"cluster":{"ID":25,"attributes":{"upgradeServerId":{"ID":0,"type":240,"name":"upgradeServerId"},"fileOffset":{"ID":1,"type":35,"name":"fileOffset"},"currentFileVersion":{"ID":2,"type":35,"name":"currentFileVersion"},"currentZigbeeStackVersion":{"ID":3,"type":33,"name":"currentZigbeeStackVersion"},"downloadedFileVersion":{"ID":4,"type":35,"name":"downloadedFileVersion"},"downloadedZigbeeStackVersion":{"ID":5,"type":33,"name":"downloadedZigbeeStackVersion"},"imageUpgradeStatus":{"ID":6,"type":48,"name":"imageUpgradeStatus"},"manufacturerId":{"ID":7,"type":33,"name":"manufacturerId"},"imageTypeId":{"ID":8,"type":33,"name":"imageTypeId"},"minimumBlockReqDelay":{"ID":9,"type":33,"name":"minimumBlockReqDelay"},"imageStamp":{"ID":10,"type":35,"name":"imageStamp"}},"name":"genOta","commands":{"queryNextImageRequest":{"ID":1,"response":2,"parameters":[{"name":"fieldControl","type":32},{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35}],"name":"queryNextImageRequest"},"imageBlockRequest":{"ID":3,"response":5,"parameters":[{"name":"fieldControl","type":32},{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35},{"name":"fileOffset","type":35},{"name":"maximumDataSize","type":32}],"name":"imageBlockRequest"},"imagePageRequest":{"ID":4,"response":5,"parameters":[{"name":"fieldControl","type":32},{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35},{"name":"fileOffset","type":35},{"name":"maximumDataSize","type":32},{"name":"pageSize","type":33},{"name":"responseSpacing","type":33}],"name":"imagePageRequest"},"upgradeEndRequest":{"ID":6,"response":7,"parameters":[{"name":"status","type":32},{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35}],"name":"upgradeEndRequest"}},"commandsResponse":{"imageNotify":{"ID":0,"parameters":[{"name":"payloadType","type":32},{"name":"queryJitter","type":32}],"name":"imageNotify"},"queryNextImageResponse":{"ID":2,"parameters":[{"name":"status","type":32},{"name":"manufacturerCode","type":33,"conditions":[{"type":"statusEquals","value":0}]},{"name":"imageType","type":33,"conditions":[{"type":"statusEquals","value":0}]},{"name":"fileVersion","type":35,"conditions":[{"type":"statusEquals","value":0}]},{"name":"imageSize","type":35,"conditions":[{"type":"statusEquals","value":0}]}],"name":"queryNextImageResponse"},"imageBlockResponse":{"ID":5,"parameters":[{"name":"status","type":32},{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35},{"name":"fileOffset","type":35},{"name":"dataSize","type":32},{"name":"data","type":1008}],"name":"imageBlockResponse"},"upgradeEndResponse":{"ID":7,"parameters":[{"name":"manufacturerCode","type":33},{"name":"imageType","type":33},{"name":"fileVersion","type":35},{"name":"currentTime","type":35},{"name":"upgradeTime","type":35}],"name":"upgradeEndResponse"}}},"command":{"ID":0,"parameters":[{"name":"payloadType","type":32},{"name":"queryJitter","type":32}],"name":"imageNotify"}};
         expect(deepClone(mocksendZclFrameToEndpoint.mock.calls[0][3])).toStrictEqual(expected);
         expect(mocksendZclFrameToEndpoint.mock.calls[0][4]).toBe(10000);
     });
@@ -2990,13 +3279,15 @@ describe('Controller', () => {
         const device = controller.getDeviceByIeeeAddr('0x129');
         const endpoint = device.getEndpoint(1);
         mocksendZclFrameToEndpoint.mockClear();
-        const promise = new Promise((resolve, reject) => resolve({frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1]))}))
+        const buffer = Buffer.from([24,169,10,0,0,24,1]);
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Zcl.Header.fromBuffer(buffer), buffer);
+        const promise = new Promise((resolve, reject) => resolve({clusterID: frame.cluster.ID, data: frame.toBuffer(), header: frame.header}))
         mockAdapterWaitFor.mockReturnValueOnce({promise, cancel: () => {}});
         const result = endpoint.waitForCommand('genOta', 'upgradeEndRequest', 10, 20);
         expect(mockAdapterWaitFor).toHaveBeenCalledTimes(1);
         expect(mockAdapterWaitFor).toHaveBeenCalledWith(129, 1, 1, 0, 10, 25, 6, 20);
         expect(result.cancel).toStrictEqual(expect.any(Function));
-        expect((await result.promise)).toStrictEqual({"header": {"commandIdentifier": 10, "frameControl": {"reservedBits": 0,"direction": 1, "disableDefaultResponse": true, "frameType": 0, "manufacturerSpecific": false}, "manufacturerCode": null, "transactionSequenceNumber": 169}, "payload": [{"attrData": 1, "attrId": 0, "dataType": 24}]});
+        expect(deepClone(await result.promise)).toStrictEqual({"header": {"commandIdentifier": 10, "frameControl": {"reservedBits": 0,"direction": 1, "disableDefaultResponse": true, "frameType": 0, "manufacturerSpecific": false}, "manufacturerCode": null, "transactionSequenceNumber": 169}, "payload": [{"attrData": 1, "attrId": 0, "dataType": 24}]});
     });
 
     it('Endpoint waitForCommand error', async () => {
@@ -3018,7 +3309,7 @@ describe('Controller', () => {
         const line = JSON.stringify({"id":3,"type":"EndDevice","ieeeAddr":"0x90fd9ffffe4b64ae","nwkAddr":19468,"manufId":4476,"manufName":"IKEA of Sweden","powerSource":"Battery","modelId":"TRADFRI remote control","epList":[1],"endpoints":{"1":{"profId":49246,"epId":1,"devId":2096,"inClusterList":[0,1,3,9,2821,4096],"outClusterList":[3,4,5,6,8,25,4096],"clusters":{}}},"appVersion":17,"stackVersion":87,"hwVersion":1,"dateCode":"20170302","swBuildId":"1.2.214","zclVersion":1,"interviewCompleted":true,"_id":"fJ5pmjqKRYbNvslK"});
         fs.writeFileSync(options.databasePath, line + "\n");
         await controller.start();
-        const expected = {"ID": 3, "_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_lastSeen": null, "_applicationVersion": 17, "_dateCode": "20170302", "_endpoints": [{"_events":{},"_eventsCount":0,"meta":{},"clusters": {}, "ID": 1, "deviceID": 2096, "_binds": [], "_configuredReportings": [],"deviceIeeeAddress": "0x90fd9ffffe4b64ae", "deviceNetworkAddress": 19468, "inputClusters": [0, 1, 3, 9, 2821, 4096], "outputClusters": [3, 4, 5, 6, 8, 25, 4096], "pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x90fd9ffffe4b64ae","sendInProgress": false}, "profileID": 49246}], "_hardwareVersion": 1, "_ieeeAddr": "0x90fd9ffffe4b64ae", "_interviewCompleted": true,"_events":{},"_eventsCount":0, "_interviewing": false, "_manufacturerID": 4476, "_manufacturerName": "IKEA of Sweden", "meta": {}, "_modelID": "TRADFRI remote control", "_networkAddress": 19468, "_powerSource": "Battery", "_softwareBuildID": "1.2.214", "_stackVersion": 87, "_type": "EndDevice", "_zclVersion": 1}
+        const expected = {"ID": 3, "_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_lastSeen": null, "_applicationVersion": 17, "_dateCode": "20170302", "_customClusters":{}, "_endpoints": [{"_events":{},"_eventsCount":0,"meta":{},"clusters": {}, "ID": 1, "deviceID": 2096, "_binds": [], "_configuredReportings": [],"deviceIeeeAddress": "0x90fd9ffffe4b64ae", "deviceNetworkAddress": 19468, "inputClusters": [0, 1, 3, 9, 2821, 4096], "outputClusters": [3, 4, 5, 6, 8, 25, 4096], "pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x90fd9ffffe4b64ae","sendInProgress": false}, "profileID": 49246}], "_hardwareVersion": 1, "_ieeeAddr": "0x90fd9ffffe4b64ae", "_interviewCompleted": true,"_events":{},"_eventsCount":0, "_interviewing": false, "_manufacturerID": 4476, "_manufacturerName": "IKEA of Sweden", "meta": {}, "_modelID": "TRADFRI remote control", "_networkAddress": 19468, "_powerSource": "Battery", "_softwareBuildID": "1.2.214", "_stackVersion": 87, "_type": "EndDevice", "_zclVersion": 1}
         expect(deepClone(controller.getDeviceByIeeeAddr("0x90fd9ffffe4b64ae"))).toStrictEqual(expected);
     });
 
@@ -3026,9 +3317,9 @@ describe('Controller', () => {
         await controller.start();
         const group = await controller.createGroup(2);
         await group.read('genBasic', ['modelId', 0x01], {});
-        expect(mocksendZclFrameToGroup).toBeCalledTimes(1);
+        expect(mocksendZclFrameToGroup).toHaveBeenCalledTimes(1);
         expect(mocksendZclFrameToGroup.mock.calls[0][0]).toBe(2);
-        expect(deepClone(mocksendZclFrameToGroup.mock.calls[0][1])).toStrictEqual(deepClone(ZclFrame.create(Zcl.FrameType.GLOBAL, Zcl.Direction.CLIENT_TO_SERVER, true, null, 2, 'read', 0, [{"attrId": 5}, {"attrId": 1}])));
+        expect(deepClone(mocksendZclFrameToGroup.mock.calls[0][1])).toStrictEqual(deepClone(Zcl.Frame.create(Zcl.FrameType.GLOBAL, Zcl.Direction.CLIENT_TO_SERVER, true, null, 2, 'read', 0, [{"attrId": 5}, {"attrId": 1}])));
         expect(mocksendZclFrameToGroup.mock.calls[0][2]).toBe(null);
     });
 
@@ -3047,9 +3338,9 @@ describe('Controller', () => {
         await controller.start();
         const group = await controller.createGroup(2);
         await group.write('genBasic', {0x0031: {value: 0x000B, type: 0x19}, deviceEnabled: true}, {});
-        expect(mocksendZclFrameToGroup).toBeCalledTimes(1);
+        expect(mocksendZclFrameToGroup).toHaveBeenCalledTimes(1);
         expect(mocksendZclFrameToGroup.mock.calls[0][0]).toBe(2);
-        expect(deepClone(mocksendZclFrameToGroup.mock.calls[0][1])).toStrictEqual(deepClone(ZclFrame.create(Zcl.FrameType.GLOBAL, Zcl.Direction.CLIENT_TO_SERVER, true, null, 2, 'write', 0, [{"attrData": 11, "attrId": 49, "dataType": 25}, {"attrData": true, "attrId": 18, "dataType": 16}])));
+        expect(deepClone(mocksendZclFrameToGroup.mock.calls[0][1])).toStrictEqual(deepClone(Zcl.Frame.create(Zcl.FrameType.GLOBAL, Zcl.Direction.CLIENT_TO_SERVER, true, null, 2, 'write', 0, [{"attrData": 11, "attrId": 49, "dataType": 25}, {"attrData": true, "attrId": 18, "dataType": 16}])));
         expect(mocksendZclFrameToGroup.mock.calls[0][2]).toBe(null);
     });
 
@@ -3082,12 +3373,12 @@ describe('Controller', () => {
         const endpoint = device.getEndpoint(1);
         const options = {manufacturerCode: 0x100B, disableDefaultResponse: true, timeout: 12, defaultResponseTimeout: 16};
         await endpoint.write('genBasic', {0x0031: {value: 0x000B, type: 0x19}}, options);
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4107,"commandIdentifier":2},"Payload":[{"attrId":49,"attrData":11,"dataType":25}],"Cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"Command":{"ID":2,"name":"write","parameters":[{"name":"attrId","type":33},{"name":"dataType","type":32},{"name":"attrData","type":1000}],"response":4}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4107,"commandIdentifier":2},"payload":[{"attrId":49,"attrData":11,"dataType":25}],"cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"command":{"ID":2,"name":"write","parameters":[{"name":"attrId","type":33},{"name":"dataType","type":32},{"name":"attrData","type":1000}],"response":4}});
         expect(call[4]).toBe(12);
     });
 
@@ -3098,13 +3389,13 @@ describe('Controller', () => {
         const device = controller.getDeviceByIeeeAddr('0x129');
         device._manufacturerID = 0x10f2;
         const endpoint = device.getEndpoint(1);
-        await endpoint.write('hvacThermostat', {'ubisysDefaultOccupiedHeatingSetpoint': 1800});
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        await endpoint.write('hvacThermostat', {'viessmannWindowOpenInternal': 1});
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect({...deepClone(call[3]), Cluster: {}}).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4338,"commandIdentifier":2},"Payload":[{"attrId":17,"attrData":1800,"dataType":41}],"Cluster":{},"Command":{"ID":2,"name":"write","parameters":[{"name":"attrId","type":33},{"name":"dataType","type":32},{"name":"attrData","type":1000}],"response":4}});
+        expect({...deepClone(call[3]), cluster: {}}).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4641,"commandIdentifier":2},"payload":[{"attrId":16384,"attrData":1,"dataType":48}],"cluster":{},"command":{"ID":2,"name":"write","parameters":[{"name":"attrId","type":33},{"name":"dataType","type":32},{"name":"attrData","type":1000}],"response":4}});
         expect(call[4]).toBe(10000);
     });
 
@@ -3116,12 +3407,12 @@ describe('Controller', () => {
         const endpoint = device.getEndpoint(1);
         const options = {manufacturerCode: 0x100B, disableDefaultResponse: true, timeout: 12, defaultResponseTimeout: 16, writeUndiv: true, disableResponse: true};
         await endpoint.write('genBasic', {0x0031: {value: 0x000B, type: 0x19}}, options);
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4107,"commandIdentifier":3},"Payload":[{"attrId":49,"attrData":11,"dataType":25}],"Cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"Command":{"ID":3,"name":"writeUndiv","parameters":[{"name":"attrId","type":33},{"name":"dataType","type":32},{"name":"attrData","type":1000}]}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4107,"commandIdentifier":3},"payload":[{"attrId":49,"attrData":11,"dataType":25}],"cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"command":{"ID":3,"name":"writeUndiv","parameters":[{"name":"attrId","type":33},{"name":"dataType","type":32},{"name":"attrData","type":1000}]}});
         expect(call[4]).toBe(12);
     });
 
@@ -3134,7 +3425,7 @@ describe('Controller', () => {
         let error;
         try {await endpoint.write('genBasic', {'UNKNOWN': {value: 0x000B, type: 0x19}}) } catch (e) {error = e}
         expect(error).toStrictEqual(new Error(`Unknown attribute 'UNKNOWN', specify either an existing attribute or a number`))
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
     });
 
     it('Write to endpoint with mixed manufacturer attributes', async () => {
@@ -3145,7 +3436,7 @@ describe('Controller', () => {
         device._manufacturerID = 0x10f2;
         const endpoint = device.getEndpoint(1);
         let error;
-        try {await endpoint.write('hvacThermostat', {'occupiedHeatingSetpoint': 2000, 'ubisysDefaultOccupiedHeatingSetpoint': 1800}) } catch (e) {error = e}
+        try {await endpoint.write('hvacThermostat', {'occupiedHeatingSetpoint': 2000, 'viessmannWindowOpenInternal': 1}) } catch (e) {error = e}
         expect(error).toStrictEqual(new Error("Cannot have attributes with different manufacturerCode in single 'write' call"))
     });
 
@@ -3156,15 +3447,15 @@ describe('Controller', () => {
         const device = controller.getDeviceByIeeeAddr('0x129');
         const endpoint = device.getEndpoint(1);
         await endpoint.writeResponse('genBasic', 99, {0x55: {status: 0x01}});
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":99,"manufacturerCode":null,"commandIdentifier":4},"Payload":[{"attrId":85,"status":1}],"Cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"Command":{"ID":4,"name":"writeRsp","parameters":[{"name":"status","type":32},{"conditions":[{"type":"statusNotEquals","value":0}],"name":"attrId","type":33}]}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":99,"manufacturerCode":null,"commandIdentifier":4},"payload":[{"attrId":85,"status":1}],"cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"command":{"ID":4,"name":"writeRsp","parameters":[{"name":"status","type":32},{"conditions":[{"type":"statusNotEquals","value":0}],"name":"attrId","type":33}]}});
         expect(call[4]).toBe(10000);
     });
-    
+
     it('Write response to endpoint with unknown string attribute', async () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
@@ -3174,7 +3465,7 @@ describe('Controller', () => {
         let error;
         try {await endpoint.writeResponse('genBasic', 99, {'UNKNOWN': {status: 0x01}}) } catch (e) {error = e}
         expect(error).toStrictEqual(new Error(`Unknown attribute 'UNKNOWN', specify either an existing attribute or a number`))
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
     });
 
     it('Write response to endpoint throw when transaction sequence number provided through options', async () => {
@@ -3186,9 +3477,9 @@ describe('Controller', () => {
         let error;
         try {await endpoint.writeResponse('genBasic', 99, {'UNKNOWN': {status: 0x01}}, {transactionSequenceNumber: 5}) } catch (e) {error = e}
         expect(error.message).toStrictEqual(`Use parameter`)
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
     });
-    
+
     it('Write response to endpoint with no status attribute specified', async () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
@@ -3198,7 +3489,7 @@ describe('Controller', () => {
         let error;
         try {await endpoint.writeResponse('genBasic', 99, {0x0001: {value: 0x55}}) } catch (e) {error = e}
         expect(error).toStrictEqual(new Error(`Missing attribute 'status'`))
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
     });
 
     it('Write response to endpoint with ZCL attribute', async () => {
@@ -3208,12 +3499,12 @@ describe('Controller', () => {
         const device = controller.getDeviceByIeeeAddr('0x129');
         const endpoint = device.getEndpoint(1);
         await endpoint.writeResponse('genBasic', 99, {zclVersion: {status: 0x01}});
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":99,"manufacturerCode":null,"commandIdentifier":4},"Payload":[{"attrId":0,"status":1}],"Cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"Command":{"ID":4,"name":"writeRsp","parameters":[{"name":"status","type":32},{"conditions":[{"type":"statusNotEquals","value":0}],"name":"attrId","type":33}]}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":99,"manufacturerCode":null,"commandIdentifier":4},"payload":[{"attrId":0,"status":1}],"cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"command":{"ID":4,"name":"writeRsp","parameters":[{"name":"status","type":32},{"conditions":[{"type":"statusNotEquals","value":0}],"name":"attrId","type":33}]}});
         expect(call[4]).toBe(10000);
     });
 
@@ -3225,7 +3516,7 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error('timeout occurred'));
         let error;
         try {await endpoint.writeResponse('genBasic', 99, {zclVersion: {status: 0x01}})} catch (e) {error = e}
-        expect(error).toStrictEqual(new Error(`WriteResponse 0x129/1 genBasic({"zclVersion":{"status":1}}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":1,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
+        expect(error).toStrictEqual(new Error(`ZCL command 0x129/1 genBasic.writeRsp({"zclVersion":{"status":1}}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":1,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":99,"writeUndiv":false}) failed (timeout occurred)`));
     });
 
     it('Read from endpoint with string', async () => {
@@ -3235,12 +3526,12 @@ describe('Controller', () => {
         const device = controller.getDeviceByIeeeAddr('0x129');
         const endpoint = device.getEndpoint(1);
         await endpoint.read('genBasic', ['stackVersion']);
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":0},"Payload":[{"attrId":2}],"Cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"Command":{"ID":0,"name":"read","parameters":[{"name":"attrId","type":33}],"response":1}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":11,"manufacturerCode":null,"commandIdentifier":0},"payload":[{"attrId":2}],"cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"command":{"ID":0,"name":"read","parameters":[{"name":"attrId","type":33}],"response":1}});
         expect(call[4]).toBe(10000);
     });
 
@@ -3251,13 +3542,13 @@ describe('Controller', () => {
         const device = controller.getDeviceByIeeeAddr('0x129');
         device._manufacturerID = 0x10f2;
         const endpoint = device.getEndpoint(1);
-        await endpoint.read('hvacThermostat', ['ubisysDefaultOccupiedHeatingSetpoint']);
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        await endpoint.read('hvacThermostat', ['viessmannWindowOpenInternal']);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect({...deepClone(call[3]), Cluster: {}}).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4338,"commandIdentifier":0},"Payload":[{"attrId":17}],"Cluster":{},"Command":{"ID":0,"name":"read","parameters":[{"name":"attrId","type":33}],"response":1}});
+        expect({...deepClone(call[3]), cluster: {}}).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4641,"commandIdentifier":0},"payload":[{"attrId":16384}],"cluster":{},"command":{"ID":0,"name":"read","parameters":[{"name":"attrId","type":33}],"response":1}});
         expect(call[4]).toBe(10000);
     });
 
@@ -3269,7 +3560,7 @@ describe('Controller', () => {
         device._manufacturerID = 0x10f2;
         const endpoint = device.getEndpoint(1);
         let error;
-        try { await endpoint.read('hvacThermostat', ['localTemp', 'ubisysRemoteTemperature']); } catch (e) { error = e };
+        try { await endpoint.read('hvacThermostat', ['localTemp', 'viessmannWindowOpenInternal']); } catch (e) { error = e };
         expect(error).toStrictEqual(new Error("Cannot have attributes with different manufacturerCode in single 'read' call"))
     });
 
@@ -3281,12 +3572,12 @@ describe('Controller', () => {
         const device = controller.getDeviceByIeeeAddr('0x129');
         const endpoint = device.getEndpoint(1);
         await endpoint.read('genBasic', [0xFF22], {manufacturerCode: 0x115F, disableDefaultResponse: true});
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4447,"commandIdentifier":0},"Payload":[{"attrId":65314}],"Cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"Command":{"ID":0,"name":"read","parameters":[{"name":"attrId","type":33}],"response":1}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4447,"commandIdentifier":0},"payload":[{"attrId":65314}],"cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"command":{"ID":0,"name":"read","parameters":[{"name":"attrId","type":33}],"response":1}});
         expect(call[4]).toBe(10000);
     });
 
@@ -3297,12 +3588,12 @@ describe('Controller', () => {
         const device = controller.getDeviceByIeeeAddr('0x129');
         const endpoint = device.getEndpoint(1);
         await endpoint.readResponse('genBasic', 99, {0x55: {value: 0x000B, type: 0x19}});
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":99,"manufacturerCode":null,"commandIdentifier":1},"Payload":[{"attrId":85,"attrData":11,"dataType":25,"status":0}],"Cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"Command":{"ID":1,"name":"readRsp","parameters":[{"name":"attrId","type":33},{"name":"status","type":32},{"name":"dataType","type":32,"conditions":[{"type":"statusEquals","value":0}]},{"name":"attrData","type":1000,"conditions":[{"type":"statusEquals","value":0}]}]}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":1,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":99,"manufacturerCode":null,"commandIdentifier":1},"payload":[{"attrId":85,"attrData":11,"dataType":25,"status":0}],"cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"command":{"ID":1,"name":"readRsp","parameters":[{"name":"attrId","type":33},{"name":"status","type":32},{"name":"dataType","type":32,"conditions":[{"type":"statusEquals","value":0}]},{"name":"attrData","type":1000,"conditions":[{"type":"statusEquals","value":0}]}]}});
         expect(call[4]).toBe(10000);
     });
 
@@ -3315,7 +3606,7 @@ describe('Controller', () => {
         let error;
         try {await endpoint.readResponse('genBasic', 99, {'UNKNOWN': {value: 0x000B, type: 0x19}}) } catch (e) {error = e}
         expect(error).toStrictEqual(new Error(`Unknown attribute 'UNKNOWN', specify either an existing attribute or a number`))
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
     });
 
     it('Read response to endpoint throw when transaction sequence number provided through options', async () => {
@@ -3327,7 +3618,7 @@ describe('Controller', () => {
         let error;
         try {await endpoint.readResponse('genBasic', 99, {'UNKNOWN': {value: 0x000B, type: 0x19}}, {transactionSequenceNumber: 5}) } catch (e) {error = e}
         expect(error.message).toStrictEqual(`Use parameter`)
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
     });
 
     it('Configure reporting endpoint custom attributes', async () => {
@@ -3343,12 +3634,12 @@ describe('Controller', () => {
             reportableChange: 25,
         }]);
 
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect({...deepClone(call[3]), Cluster: {}}).toStrictEqual({"Cluster":{},"Command":{"ID":6,"name":"configReport","parameters":[{"name":"direction","type":32},{"name":"attrId","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"dataType","type":32},{"conditions":[{"type":"directionEquals","value":0}],"name":"minRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"maxRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0},{"type":"dataTypeValueTypeEquals","value":"ANALOG"}],"name":"repChange","type":1000},{"conditions":[{"type":"directionEquals","value":1}],"name":"timeout","type":33}],"response":7},"Header":{"commandIdentifier":6,"frameControl":{"direction":0,"disableDefaultResponse":true,"frameType":0,"manufacturerSpecific":false,"reservedBits":0},"manufacturerCode":null,"transactionSequenceNumber":11},"Payload":[{"attrId":16388,"dataType":41,"direction":0,"maxRepIntval":3600,"minRepIntval":0,"repChange":25}]});
+        expect({...deepClone(call[3]), cluster: {}}).toStrictEqual({"cluster":{},"command":{"ID":6,"name":"configReport","parameters":[{"name":"direction","type":32},{"name":"attrId","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"dataType","type":32},{"conditions":[{"type":"directionEquals","value":0}],"name":"minRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0}],"name":"maxRepIntval","type":33},{"conditions":[{"type":"directionEquals","value":0},{"type":"dataTypeValueTypeEquals","value":"ANALOG"}],"name":"repChange","type":1000},{"conditions":[{"type":"directionEquals","value":1}],"name":"timeout","type":33}],"response":7},"header":{"commandIdentifier":6,"frameControl":{"direction":0,"disableDefaultResponse":true,"frameType":0,"manufacturerSpecific":false,"reservedBits":0},"manufacturerCode":null,"transactionSequenceNumber":11},"payload":[{"attrId":16388,"dataType":41,"direction":0,"maxRepIntval":3600,"minRepIntval":0,"repChange":25}]});
         expect(call[4]).toBe(10000);
 
         const hvacThermostat = Zcl.Utils.getCluster('hvacThermostat');
@@ -3380,12 +3671,12 @@ describe('Controller', () => {
         expect(group1.members).toStrictEqual([]);
         expect(Array.from(group6.members)).toStrictEqual([device2.getEndpoint(1)]);
         expect(Array.from(group7.members)).toStrictEqual([device2.getEndpoint(1)]);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":25,"manufacturerCode":null,"commandIdentifier":4},"Payload":{},"Cluster":{"ID":4,"attributes":{"nameSupport":{"ID":0,"type":24,"name":"nameSupport"}},"name":"genGroups","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"},"view":{"ID":1,"parameters":[{"name":"groupid","type":33}],"name":"view"},"getMembership":{"ID":2,"response":2,"parameters":[{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembership"},"miboxerSetZones":{"ID":240,"name":"miboxerSetZones","parameters":[{"name":"zones","type":1012}]},"remove":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"},"removeAll":{"ID":4,"parameters":[],"name":"removeAll"},"addIfIdentifying":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"addIfIdentifying"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"viewRsp"},"getMembershipRsp":{"ID":2,"parameters":[{"name":"capacity","type":32},{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembershipRsp"},"removeRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeRsp"}}},"Command":{"ID":4,"parameters":[],"name":"removeAll"}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false},"transactionSequenceNumber":25,"manufacturerCode":null,"commandIdentifier":4},"payload":{},"cluster":{"ID":4,"attributes":{"nameSupport":{"ID":0,"type":24,"name":"nameSupport"}},"name":"genGroups","commands":{"add":{"ID":0,"response":0,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"add"},"view":{"ID":1,"parameters":[{"name":"groupid","type":33}],"name":"view"},"getMembership":{"ID":2,"response":2,"parameters":[{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembership"},"miboxerSetZones":{"ID":240,"name":"miboxerSetZones","parameters":[{"name":"zones","type":1012}]},"remove":{"ID":3,"response":3,"parameters":[{"name":"groupid","type":33}],"name":"remove"},"removeAll":{"ID":4,"parameters":[],"name":"removeAll"},"addIfIdentifying":{"ID":5,"parameters":[{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"addIfIdentifying"}},"commandsResponse":{"addRsp":{"ID":0,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"addRsp"},"viewRsp":{"ID":1,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33},{"name":"groupname","type":66}],"name":"viewRsp"},"getMembershipRsp":{"ID":2,"parameters":[{"name":"capacity","type":32},{"name":"groupcount","type":32},{"name":"grouplist","type":1002}],"name":"getMembershipRsp"},"removeRsp":{"ID":3,"parameters":[{"name":"status","type":32},{"name":"groupid","type":33}],"name":"removeRsp"}}},"command":{"ID":4,"parameters":[],"name":"removeAll"}});
     });
 
     it('Load database', async () => {
         const database = `
-        {"id":1,"type":"Coordinator","ieeeAddr":"0x123","nwkAddr":0,"manufId":0,"epList":[11,6,5,4,3,2,1],"endpoints":{"1":{"profId":260,"epId":1,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"2":{"profId":257,"epId":2,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"3":{"profId":261,"epId":3,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"4":{"profId":263,"epId":4,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"5":{"profId":264,"epId":5,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"6":{"profId":265,"epId":6,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"11":{"profId":260,"epId":11,"devId":1024,"inClusterList":[],"meta":{},"outClusterList":[1280],"clusters":{}}},"interviewCompleted":false,"meta":{},"_id":"aM341ldunExFmJ3u"}
+        {"id":1,"type":"Coordinator","ieeeAddr":"0x0000012300000000","nwkAddr":0,"manufId":0,"epList":[11,6,5,4,3,2,1],"endpoints":{"1":{"profId":260,"epId":1,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"2":{"profId":257,"epId":2,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"3":{"profId":261,"epId":3,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"4":{"profId":263,"epId":4,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"5":{"profId":264,"epId":5,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"6":{"profId":265,"epId":6,"devId":5,"inClusterList":[],"meta":{},"outClusterList":[],"clusters":{}},"11":{"profId":260,"epId":11,"devId":1024,"inClusterList":[],"meta":{},"outClusterList":[1280],"clusters":{}}},"interviewCompleted":false,"meta":{},"_id":"aM341ldunExFmJ3u"}
         {"id":2,"type":"Group","groupID":1,"members":[],"meta":{},"_id":"kiiAEst4irEEqG8T"}
         {"id":3,"type":"Router","ieeeAddr":"0x000b57fffec6a5b2","nwkAddr":40369,"manufId":4476,"manufName":"IKEA of Sweden","powerSource":"Mains (single phase)","modelId":"TRADFRI bulb E27 WS opal 980lm","epList":[1],"endpoints":{"1":{"profId":49246,"epId":1,"devId":544,"inClusterList":[0,3,4,5,6,8,768,2821,4096],"meta":{},"outClusterList":[5,25,32,4096],"clusters":{}}},"appVersion":17,"stackVersion":87,"hwVersion":1,"dateCode":"20170331","swBuildId":"1.2.217","zclVersion":1,"interviewCompleted":true,"meta":{"reporting":1},"_id":"pagvP2f9Bbj3o9TM"}
         {"id":4,"type":"EndDevice","ieeeAddr":"0x0017880104e45517","nwkAddr":6535,"manufId":4107,"manufName":"Philips","powerSource":"Battery","modelId":"RWL021","epList":[1,2],"endpoints":{"1":{"profId":49246,"epId":1,"devId":2096,"inClusterList":[0],"meta":{},"outClusterList":[0,3,4,6,8,5],"clusters":{}},"2":{"profId":260,"epId":2,"devId":12,"inClusterList":[0,1,3,15,64512],"meta":{},"outClusterList":[25],"clusters":{}}},"appVersion":2,"stackVersion":1,"hwVersion":1,"dateCode":"20160302","swBuildId":"5.45.1.17846","zclVersion":1,"interviewCompleted":true,"meta":{"configured":1},"_id":"qxhymbX6H2GXDw8Z"}
@@ -3398,10 +3689,10 @@ describe('Controller', () => {
         fs.writeFileSync(options.databasePath, database);
         await controller.start();
         expect((controller.getDevices()).length).toBe(4);
-        expect(deepClone(controller.getDeviceByIeeeAddr('0x123'))).toStrictEqual({"ID":1,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_endpoints":[{"deviceID":5,"_events":{},"_eventsCount":0,"inputClusters":[],"outputClusters":[],"profileID":260,"ID":1,"clusters":{},"deviceIeeeAddress":"0x123","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x123","sendInProgress": false}},{"deviceID":5,"inputClusters":[],"outputClusters":[],"profileID":257,"ID":2,"clusters":{},"deviceIeeeAddress":"0x123","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 2,"deviceIeeeAddress": "0x123","sendInProgress": false}},{"deviceID":5,"inputClusters":[],"outputClusters":[],"profileID":261,"ID":3,"clusters":{},"deviceIeeeAddress":"0x123","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 3,"deviceIeeeAddress": "0x123","sendInProgress": false}},{"deviceID":5,"inputClusters":[],"outputClusters":[],"profileID":263,"ID":4,"clusters":{},"deviceIeeeAddress":"0x123","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 4,"deviceIeeeAddress": "0x123","sendInProgress": false}},{"deviceID":5,"inputClusters":[],"outputClusters":[],"profileID":264,"ID":5,"clusters":{},"deviceIeeeAddress":"0x123","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 5,"deviceIeeeAddress": "0x123","sendInProgress": false}},{"deviceID":5,"inputClusters":[],"outputClusters":[],"profileID":265,"ID":6,"clusters":{},"deviceIeeeAddress":"0x123","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 6,"deviceIeeeAddress": "0x123","sendInProgress": false}},{"deviceID":1024,"inputClusters":[],"outputClusters":[1280],"profileID":260,"ID":11,"clusters":{},"deviceIeeeAddress":"0x123","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 11,"deviceIeeeAddress": "0x123","sendInProgress": false}}],"_ieeeAddr":"0x123","_interviewCompleted":false,"_interviewing":false,"_lastSeen":null,"_manufacturerID":0,"_networkAddress":0,"_type":"Coordinator","_skipDefaultResponse":false,"_skipTimeResponse":false,"meta":{}});
-        expect(deepClone(controller.getDeviceByIeeeAddr('0x000b57fffec6a5b2'))).toStrictEqual({"ID": 3,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_lastSeen": null,  "_applicationVersion": 17, "_dateCode": "20170331", "_endpoints": [{"_events":{},"_eventsCount":0,"meta":{},"_binds": [], "_configuredReportings": [], "clusters": {}, "ID": 1, "deviceID": 544, "deviceIeeeAddress": "0x000b57fffec6a5b2", "deviceNetworkAddress": 40369, "inputClusters": [0, 3, 4, 5, 6, 8, 768, 2821, 4096], "outputClusters": [5, 25, 32, 4096],  "pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x000b57fffec6a5b2","sendInProgress": false},"profileID": 49246}], "_hardwareVersion": 1, "_ieeeAddr": "0x000b57fffec6a5b2", "_interviewCompleted": true,"_events":{},"_eventsCount":0, "_interviewing": false, "_manufacturerID": 4476, "_manufacturerName": "IKEA of Sweden", "meta": {"reporting": 1}, "_modelID": "TRADFRI bulb E27 WS opal 980lm", "_networkAddress": 40369, "_powerSource": "Mains (single phase)", "_softwareBuildID": "1.2.217", "_stackVersion": 87, "_type": "Router", "_zclVersion": 1});
-        expect(deepClone(controller.getDeviceByIeeeAddr('0x0017880104e45517'))).toStrictEqual({"ID":4,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_applicationVersion":2,"_dateCode":"20160302","_endpoints":[{"deviceID":2096,"_events":{},"_eventsCount":0,"inputClusters":[0],"outputClusters":[0,3,4,6,8,5],"profileID":49246,"ID":1,"clusters":{"genBasic":{"dir":{"value":3},"attributes":{"modelId":"RWL021"}}},"deviceIeeeAddress":"0x0017880104e45517","deviceNetworkAddress":6538,"_binds":[{"type":"endpoint","endpointID":1,"deviceIeeeAddr":"0x000b57fffec6a5b2"}],"_configuredReportings":[{"cluster":1,"attrId":0,"minRepIntval":1,"maxRepIntval":20,"repChange":2}],"meta":{},"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x0017880104e45517","sendInProgress": false}},{"deviceID":12,"inputClusters":[0,1,3,15,64512],"outputClusters":[25],"profileID":260,"ID":2,"clusters":{},"deviceIeeeAddress":"0x0017880104e45517","deviceNetworkAddress":6538,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 2,"deviceIeeeAddress": "0x0017880104e45517","sendInProgress": false}}],"_hardwareVersion":1,"_ieeeAddr":"0x0017880104e45517","_interviewCompleted":true,"_interviewing":false,"_lastSeen":123,"_manufacturerID":4107,"_manufacturerName":"Philips","_modelID":"RWL021","_networkAddress":6538,"_powerSource":"Battery","_softwareBuildID":"5.45.1.17846","_stackVersion":1,"_type":"EndDevice","_zclVersion":1,"_skipDefaultResponse":false,"_skipTimeResponse":false,"meta":{"configured":1}});
-        expect(deepClone(controller.getDeviceByIeeeAddr('0x0017880104e45518'))).toStrictEqual({"ID":6,"_checkinInterval":123456,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":123456000,"_applicationVersion":2,"_dateCode":"20160302","_endpoints":[{"deviceID":2096,"_events":{},"_eventsCount":0,"inputClusters":[0],"outputClusters":[0,3,4,6,8,5],"profileID":49246,"ID":1,"clusters":{},"deviceIeeeAddress":"0x0017880104e45518","deviceNetworkAddress":6536,"_binds":[],"_configuredReportings":[],"meta":{},"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x0017880104e45518","sendInProgress": false}},{"deviceID":12,"inputClusters":[0,1,3,15,32,64512],"outputClusters":[25],"profileID":260,"ID":2,"clusters":{},"deviceIeeeAddress":"0x0017880104e45518","deviceNetworkAddress":6536,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 2,"deviceIeeeAddress": "0x0017880104e45518","sendInProgress": false}}],"_hardwareVersion":1,"_ieeeAddr":"0x0017880104e45518","_interviewCompleted":true,"_interviewing":false,"_lastSeen":null,"_manufacturerID":4107,"_manufacturerName":"Philips","_modelID":"RWL021","_networkAddress":6536,"_powerSource":"Battery","_softwareBuildID":"5.45.1.17846","_stackVersion":1,"_type":"EndDevice","_zclVersion":1,"_skipDefaultResponse":false,"_skipTimeResponse":false,"meta":{"configured":1}});
+        expect(deepClone(controller.getDeviceByIeeeAddr('0x0000012300000000'))).toStrictEqual({"ID":1,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_customClusters":{},"_endpoints":[{"deviceID":5,"_events":{},"_eventsCount":0,"inputClusters":[],"outputClusters":[],"profileID":260,"ID":1,"clusters":{},"deviceIeeeAddress":"0x0000012300000000","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x0000012300000000","sendInProgress": false}},{"deviceID":5,"inputClusters":[],"outputClusters":[],"profileID":257,"ID":2,"clusters":{},"deviceIeeeAddress":"0x0000012300000000","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 2,"deviceIeeeAddress": "0x0000012300000000","sendInProgress": false}},{"deviceID":5,"inputClusters":[],"outputClusters":[],"profileID":261,"ID":3,"clusters":{},"deviceIeeeAddress":"0x0000012300000000","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 3,"deviceIeeeAddress": "0x0000012300000000","sendInProgress": false}},{"deviceID":5,"inputClusters":[],"outputClusters":[],"profileID":263,"ID":4,"clusters":{},"deviceIeeeAddress":"0x0000012300000000","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 4,"deviceIeeeAddress": "0x0000012300000000","sendInProgress": false}},{"deviceID":5,"inputClusters":[],"outputClusters":[],"profileID":264,"ID":5,"clusters":{},"deviceIeeeAddress":"0x0000012300000000","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 5,"deviceIeeeAddress": "0x0000012300000000","sendInProgress": false}},{"deviceID":5,"inputClusters":[],"outputClusters":[],"profileID":265,"ID":6,"clusters":{},"deviceIeeeAddress":"0x0000012300000000","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 6,"deviceIeeeAddress": "0x0000012300000000","sendInProgress": false}},{"deviceID":1024,"inputClusters":[],"outputClusters":[1280],"profileID":260,"ID":11,"clusters":{},"deviceIeeeAddress":"0x0000012300000000","deviceNetworkAddress":0,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 11,"deviceIeeeAddress": "0x0000012300000000","sendInProgress": false}}],"_ieeeAddr":"0x0000012300000000","_interviewCompleted":false,"_interviewing":false,"_lastSeen":null,"_manufacturerID":0,"_networkAddress":0,"_type":"Coordinator","_skipDefaultResponse":false,"meta":{}});
+        expect(deepClone(controller.getDeviceByIeeeAddr('0x000b57fffec6a5b2'))).toStrictEqual({"ID": 3,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_lastSeen": null,  "_applicationVersion": 17, "_dateCode": "20170331", "_customClusters":{}, "_endpoints": [{"_events":{},"_eventsCount":0,"meta":{},"_binds": [], "_configuredReportings": [], "clusters": {}, "ID": 1, "deviceID": 544, "deviceIeeeAddress": "0x000b57fffec6a5b2", "deviceNetworkAddress": 40369, "inputClusters": [0, 3, 4, 5, 6, 8, 768, 2821, 4096], "outputClusters": [5, 25, 32, 4096],  "pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x000b57fffec6a5b2","sendInProgress": false},"profileID": 49246}], "_hardwareVersion": 1, "_ieeeAddr": "0x000b57fffec6a5b2", "_interviewCompleted": true,"_events":{},"_eventsCount":0, "_interviewing": false, "_manufacturerID": 4476, "_manufacturerName": "IKEA of Sweden", "meta": {"reporting": 1}, "_modelID": "TRADFRI bulb E27 WS opal 980lm", "_networkAddress": 40369, "_powerSource": "Mains (single phase)", "_softwareBuildID": "1.2.217", "_stackVersion": 87, "_type": "Router", "_zclVersion": 1});
+        expect(deepClone(controller.getDeviceByIeeeAddr('0x0017880104e45517'))).toStrictEqual({"ID":4,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_applicationVersion":2,"_dateCode":"20160302","_customClusters":{},"_endpoints":[{"deviceID":2096,"_events":{},"_eventsCount":0,"inputClusters":[0],"outputClusters":[0,3,4,6,8,5],"profileID":49246,"ID":1,"clusters":{"genBasic":{"dir":{"value":3},"attributes":{"modelId":"RWL021"}}},"deviceIeeeAddress":"0x0017880104e45517","deviceNetworkAddress":6538,"_binds":[{"type":"endpoint","endpointID":1,"deviceIeeeAddr":"0x000b57fffec6a5b2"}],"_configuredReportings":[{"cluster":1,"attrId":0,"minRepIntval":1,"maxRepIntval":20,"repChange":2}],"meta":{},"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x0017880104e45517","sendInProgress": false}},{"deviceID":12,"inputClusters":[0,1,3,15,64512],"outputClusters":[25],"profileID":260,"ID":2,"clusters":{},"deviceIeeeAddress":"0x0017880104e45517","deviceNetworkAddress":6538,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 2,"deviceIeeeAddress": "0x0017880104e45517","sendInProgress": false}}],"_hardwareVersion":1,"_ieeeAddr":"0x0017880104e45517","_interviewCompleted":true,"_interviewing":false,"_lastSeen":123,"_manufacturerID":4107,"_manufacturerName":"Philips","_modelID":"RWL021","_networkAddress":6538,"_powerSource":"Battery","_softwareBuildID":"5.45.1.17846","_stackVersion":1,"_type":"EndDevice","_zclVersion":1,"_skipDefaultResponse":false,"meta":{"configured":1}});
+        expect(deepClone(controller.getDeviceByIeeeAddr('0x0017880104e45518'))).toStrictEqual({"ID":6,"_checkinInterval":123456,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":123456000,"_applicationVersion":2,"_dateCode":"20160302","_customClusters":{},"_endpoints":[{"deviceID":2096,"_events":{},"_eventsCount":0,"inputClusters":[0],"outputClusters":[0,3,4,6,8,5],"profileID":49246,"ID":1,"clusters":{},"deviceIeeeAddress":"0x0017880104e45518","deviceNetworkAddress":6536,"_binds":[],"_configuredReportings":[],"meta":{},"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x0017880104e45518","sendInProgress": false}},{"deviceID":12,"inputClusters":[0,1,3,15,32,64512],"outputClusters":[25],"profileID":260,"ID":2,"clusters":{},"deviceIeeeAddress":"0x0017880104e45518","deviceNetworkAddress":6536,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 2,"deviceIeeeAddress": "0x0017880104e45518","sendInProgress": false}}],"_hardwareVersion":1,"_ieeeAddr":"0x0017880104e45518","_interviewCompleted":true,"_interviewing":false,"_lastSeen":null,"_manufacturerID":4107,"_manufacturerName":"Philips","_modelID":"RWL021","_networkAddress":6536,"_powerSource":"Battery","_softwareBuildID":"5.45.1.17846","_stackVersion":1,"_type":"EndDevice","_zclVersion":1,"_skipDefaultResponse":false,"meta":{"configured":1}});
         expect((await controller.getGroups({})).length).toBe(2);
 
         const group1 = controller.getGroupByID(1);
@@ -3436,12 +3727,16 @@ describe('Controller', () => {
     });
 
     it('Should save received attributes', async () => {
+        let buffer = Buffer.from([24,169,10,0,0,24,1]);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+        let frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Zcl.Header.fromBuffer(buffer), buffer);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
@@ -3450,11 +3745,15 @@ describe('Controller', () => {
         const endpoint = device.endpoints[0];
         expect(endpoint.getClusterAttributeValue('msOccupancySensing', 'occupancy')).toBe(1);
         expect(endpoint.getClusterAttributeValue('genBasic', 'modelId')).toBeNull();
-
-        await mockAdapterEvents['zclData']({
+        
+        buffer = Buffer.from([24,169,10,0,0,24,0]);
+        frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Zcl.Header.fromBuffer(buffer), buffer);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,0])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
@@ -3468,85 +3767,50 @@ describe('Controller', () => {
         mockZStackAdapterIsValidPath.mockReturnValueOnce(true);
         await Adapter.create(null, {path: '/dev/bla', baudRate: 100, rtscts: false, adapter: null}, null, null);
         expect(mockZStackAdapterIsValidPath).toHaveBeenCalledWith('/dev/bla');
-        expect(ZStackAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/bla", "rtscts": false, adapter: null}, null, null, undefined);
+        expect(ZStackAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/bla", "rtscts": false, adapter: null}, null, null);
     });
 
     it('Adapter create continue when is valid path fails', async () => {
         mockZStackAdapterIsValidPath.mockImplementationOnce(() => {throw new Error('failed')});
         await Adapter.create(null, {path: '/dev/bla', baudRate: 100, rtscts: false, adapter: null}, null, null);
         expect(mockZStackAdapterIsValidPath).toHaveBeenCalledWith('/dev/bla');
-        expect(ZStackAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/bla", "rtscts": false, adapter: null}, null, null, undefined);
+        expect(ZStackAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/bla", "rtscts": false, adapter: null}, null, null);
     });
 
     it('Adapter create auto detect', async () => {
         mockZStackAdapterIsValidPath.mockReturnValueOnce(true);
         mockZStackAdapterAutoDetectPath.mockReturnValueOnce('/dev/test');
         await Adapter.create(null, {path: null, baudRate: 100, rtscts: false, adapter: null}, null, null);
-        expect(ZStackAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/test", "rtscts": false, adapter: null}, null, null, undefined);
+        expect(ZStackAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/test", "rtscts": false, adapter: null}, null, null);
     });
 
     it('Adapter mdns timeout test', async () => {
         const fakeAdapterName = 'mdns_test_device';
-        const mockLoggerDebug = jest.fn();
-        const mockLoggerInfo = jest.fn();
-        const mockLoggerWarn = jest.fn();
-        const mockLoggerError = jest.fn();
-        const mockLogger: LoggerStub = {
-            debug: mockLoggerDebug,
-            info: mockLoggerInfo,
-            warn: mockLoggerWarn,
-            error: mockLoggerError
-        };
-        let error;
+
         try {
-            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null);
         } catch(e) {
-            error = e;
+            expect(e).toStrictEqual(new Error(`Coordinator [${fakeAdapterName}] not found after timeout of 2000ms!`));
         }
-        expect(error).toStrictEqual(new Error(`Coordinator [${fakeAdapterName}] not found after timeout of 2000ms!`));
     });
 
     it('Adapter mdns without type test', async () => {
         const fakeAdapterName = '';
-        const mockLoggerDebug = jest.fn();
-        const mockLoggerInfo = jest.fn();
-        const mockLoggerWarn = jest.fn();
-        const mockLoggerError = jest.fn();
-        const mockLogger: LoggerStub = {
-            debug: mockLoggerDebug,
-            info: mockLoggerInfo,
-            warn: mockLoggerWarn,
-            error: mockLoggerError
-        };
-        let error;
+
         try {
-            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null,);
         } catch(e) {
-            error = e;
+            expect(e).toStrictEqual(new Error(
+                `No mdns device specified. You must specify the coordinator mdns service type after mdns://, e.g. mdns://my-adapter`
+            ));
         }
-        expect(error).toStrictEqual(new Error(
-            `No mdns device specified. You must specify the coordinator mdns service type after mdns://, e.g. mdns://my-adapter`
-        ));
     });
 
     it('Adapter mdns wrong Zeroconf test', async () => {
         const fakeAdapterName = 'mdns_test_device';
         const fakeIp = '111.111.111.111';
         const fakePort = 6638;
-        const fakeRadio = 'znp';
-        const fakeRadioDetected = fakeRadio == 'znp' ? 'zstack' : fakeRadio;
         const fakeBaud = '115200';
-
-        const mockLoggerDebug = jest.fn();
-        const mockLoggerInfo = jest.fn();
-        const mockLoggerWarn = jest.fn();
-        const mockLoggerError = jest.fn();
-        const mockLogger: LoggerStub = {
-            debug: mockLoggerDebug,
-            info: mockLoggerInfo,
-            warn: mockLoggerWarn,
-            error: mockLoggerError
-        };
 
         Bonjour.prototype.findOne = function(opts?: BrowserConfig | undefined, timeout?: number, callback?: CallableFunction) {
             setTimeout(() => {
@@ -3554,20 +3818,17 @@ describe('Controller', () => {
             }, 200);
         }
 
-        let error;
         try {
-            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null);
         } catch(e) {
-            error = e;
+            expect(e).toStrictEqual(new Error(
+                `Coordinator returned wrong Zeroconf format! The following values are expected:\n` +
+                `txt.radio_type, got: undefined\n` +
+                `txt.baud_rate, got: 115200\n` +
+                `address, got: 111.111.111.111\n` +
+                `port, got: 6638`
+            ));
         }
-        expect(error).toStrictEqual(new Error(
-            `Coordinator returned wrong Zeroconf format! The following values are expected:\n` +
-            `txt.radio_type, got: undefined\n` +
-            `txt.baud_rate, got: 115200\n` +
-            `address, got: 111.111.111.111\n` +
-            `port, got: 6638`
-        ));
-        
     });
 
     it('Adapter mdns detection ezsp test', async () => {
@@ -3575,19 +3836,7 @@ describe('Controller', () => {
         const fakeIp = '111.111.111.111';
         const fakePort = 6638;
         const fakeRadio = 'ezsp';
-        const fakeRadioDetected = fakeRadio == 'znp' ? 'zstack' : fakeRadio;
         const fakeBaud = '115200';
-
-        const mockLoggerDebug = jest.fn();
-        const mockLoggerInfo = jest.fn();
-        const mockLoggerWarn = jest.fn();
-        const mockLoggerError = jest.fn();
-        const mockLogger: LoggerStub = {
-            debug: mockLoggerDebug,
-            info: mockLoggerInfo,
-            warn: mockLoggerWarn,
-            error: mockLoggerError
-        };
 
         Bonjour.prototype.findOne = function(opts?: BrowserConfig | undefined, timeout?: number, callback?: CallableFunction) {
             setTimeout(() => {
@@ -3595,14 +3844,14 @@ describe('Controller', () => {
             }, 200);
         }
 
-        await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+        await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null);
 
-        expect(mockLoggerInfo.mock.calls[0][0]).toBe(`Starting mdns discovery for coordinator: ${fakeAdapterName}`);
-        expect(mockLoggerInfo.mock.calls[1][0]).toBe(`Coordinator Ip: ${fakeIp}`);
-        expect(mockLoggerInfo.mock.calls[2][0]).toBe(`Coordinator Port: ${fakePort}`);
-        expect(mockLoggerInfo.mock.calls[3][0]).toBe(`Coordinator Radio: ${fakeRadioDetected}`);
-        expect(mockLoggerInfo.mock.calls[4][0]).toBe(`Coordinator Baud: ${fakeBaud}\n`);
-        
+        expect(mockLogger.info.mock.calls[0][0]).toBe(`Starting mdns discovery for coordinator: ${fakeAdapterName}`);
+        expect(mockLogger.info.mock.calls[1][0]).toBe(`Coordinator Ip: ${fakeIp}`);
+        expect(mockLogger.info.mock.calls[2][0]).toBe(`Coordinator Port: ${fakePort}`);
+        expect(mockLogger.info.mock.calls[3][0]).toBe(`Coordinator Radio: ${fakeRadio}`);
+        expect(mockLogger.info.mock.calls[4][0]).toBe(`Coordinator Baud: ${fakeBaud}\n`);
+
     });
 
     it('Adapter mdns detection unsupported adapter test', async () => {
@@ -3612,34 +3861,17 @@ describe('Controller', () => {
         const fakeRadio = 'auto';
         const fakeBaud = '115200';
 
-        const mockLoggerDebug = jest.fn();
-        const mockLoggerInfo = jest.fn();
-        const mockLoggerWarn = jest.fn();
-        const mockLoggerError = jest.fn();
-        const mockLogger: LoggerStub = {
-            debug: mockLoggerDebug,
-            info: mockLoggerInfo,
-            warn: mockLoggerWarn,
-            error: mockLoggerError
-        };
-
         Bonjour.prototype.findOne = function(opts?: BrowserConfig | undefined, timeout?: number, callback?: CallableFunction) {
             setTimeout(() => {
                 callback({name: 'fakeAdapter', type: fakeAdapterName, port: fakePort, addresses: [fakeIp], txt: {radio_type: fakeRadio, baud_rate: fakeBaud}});
             }, 200);
         }
 
-        let error;
         try {
-            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+            await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null);
         } catch (e) {
-            error = e;
+            expect(e).toStrictEqual(new Error(`Adapter ${fakeRadio} is not supported.`));
         }
-
-        expect(error).toStrictEqual(new Error(
-            `Adapter ${fakeRadio} is not supported.`
-        ));
-        
     });
 
     it('Adapter mdns detection zstack test', async () => {
@@ -3647,19 +3879,7 @@ describe('Controller', () => {
         const fakeIp = '111.111.111.111';
         const fakePort = 6638;
         const fakeRadio = 'znp';
-        const fakeRadioDetected = fakeRadio == 'znp' ? 'zstack' : fakeRadio;
         const fakeBaud = '115200';
-
-        const mockLoggerDebug = jest.fn();
-        const mockLoggerInfo = jest.fn();
-        const mockLoggerWarn = jest.fn();
-        const mockLoggerError = jest.fn();
-        const mockLogger: LoggerStub = {
-            debug: mockLoggerDebug,
-            info: mockLoggerInfo,
-            warn: mockLoggerWarn,
-            error: mockLoggerError
-        };
 
         Bonjour.prototype.findOne = function(opts?: BrowserConfig | undefined, timeout?: number, callback?: CallableFunction) {
             setTimeout(() => {
@@ -3667,34 +3887,31 @@ describe('Controller', () => {
             }, 200);
         }
 
-        await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null, mockLogger);
+        await Adapter.create(null, {path: `mdns://${fakeAdapterName}`, baudRate: 100, rtscts: false, adapter: null}, null, null);
 
-        expect(mockLoggerInfo.mock.calls[0][0]).toBe(`Starting mdns discovery for coordinator: ${fakeAdapterName}`);
-        expect(mockLoggerInfo.mock.calls[1][0]).toBe(`Coordinator Ip: ${fakeIp}`);
-        expect(mockLoggerInfo.mock.calls[2][0]).toBe(`Coordinator Port: ${fakePort}`);
-        expect(mockLoggerInfo.mock.calls[3][0]).toBe(`Coordinator Radio: ${fakeRadioDetected}`);
-        expect(mockLoggerInfo.mock.calls[4][0]).toBe(`Coordinator Baud: ${fakeBaud}\n`);
-        
+        expect(mockLogger.info.mock.calls[0][0]).toBe(`Starting mdns discovery for coordinator: ${fakeAdapterName}`);
+        expect(mockLogger.info.mock.calls[1][0]).toBe(`Coordinator Ip: ${fakeIp}`);
+        expect(mockLogger.info.mock.calls[2][0]).toBe(`Coordinator Port: ${fakePort}`);
+        expect(mockLogger.info.mock.calls[3][0]).toBe(`Coordinator Radio: zstack`);
+        expect(mockLogger.info.mock.calls[4][0]).toBe(`Coordinator Baud: ${fakeBaud}\n`);
     });
 
     it('Adapter create auto detect nothing found', async () => {
         mockZStackAdapterIsValidPath.mockReturnValueOnce(false);
         mockZStackAdapterAutoDetectPath.mockReturnValueOnce(null);
 
-        let error;
         try {
             await Adapter.create(null, {path: null, baudRate: 100, rtscts: false, adapter: null}, null, null);
         } catch(e) {
-            error = e;
+            expect(e).toStrictEqual(new Error('No path provided and failed to auto detect path'));
         }
-        expect(error).toStrictEqual(new Error('No path provided and failed to auto detect path'));
     });
 
     it('Adapter create with unknown path should take ZStackAdapter by default', async () => {
         mockZStackAdapterIsValidPath.mockReturnValueOnce(false);
         mockZStackAdapterAutoDetectPath.mockReturnValueOnce('/dev/test');
         await Adapter.create(null, {path: null, baudRate: 100, rtscts: false, adapter: null}, null, null);
-        expect(ZStackAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/test", "rtscts": false, adapter: null}, null, null, undefined);
+        expect(ZStackAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/test", "rtscts": false, adapter: null}, null, null);
     });
 
     it('Adapter create should be able to specify adapter', async () => {
@@ -3705,9 +3922,9 @@ describe('Controller', () => {
         mockZiGateAdapterIsValidPath.mockReturnValueOnce(false);
         mockZiGateAdapterAutoDetectPath.mockReturnValueOnce('/dev/test');
         await Adapter.create(null, {path: null, baudRate: 100, rtscts: false, adapter: 'deconz'}, null, null);
-        expect(DeconzAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/test", "rtscts": false, adapter: 'deconz'}, null, null, undefined);
+        expect(DeconzAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/test", "rtscts": false, adapter: 'deconz'}, null, null);
         await Adapter.create(null, {path: null, baudRate: 100, rtscts: false, adapter: 'zigate'}, null, null);
-        expect(ZiGateAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/test", "rtscts": false, adapter: 'zigate'}, null, null, undefined);
+        expect(ZiGateAdapter).toHaveBeenCalledWith(null, {"baudRate": 100, "path": "/dev/test", "rtscts": false, adapter: 'zigate'}, null, null);
     });
 
     it('Adapter create should throw on uknown adapter', async () => {
@@ -3715,19 +3932,25 @@ describe('Controller', () => {
         mockZStackAdapterAutoDetectPath.mockReturnValueOnce('/dev/test');
         mockDeconzAdapterIsValidPath.mockReturnValueOnce(false);
         mockDeconzAdapterAutoDetectPath.mockReturnValueOnce('/dev/test');
-        let error;
-        try {await Adapter.create(null, {path: null, baudRate: 100, rtscts: false, adapter: 'efr'}, null, null)} catch (e) {error = e;}
-        expect(error).toStrictEqual(new Error(`Adapter 'efr' does not exists, possible options: zstack, deconz, zigate, ezsp, ember`));
+
+        try {
+            await Adapter.create(null, {path: null, baudRate: 100, rtscts: false, adapter: 'efr'}, null, null)
+        } catch (e) {
+            expect(e).toStrictEqual(new Error(`Adapter 'efr' does not exists, possible options: zstack, deconz, zigate, ezsp, ember`));
+        }
     });
 
     it('Emit read from device', async () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+        const frame = Zcl.Frame.create(0, 0, true, null, 40, 0, 1, [{attrId: 0}, {attrId: 9999}]);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
             // Attrid 9999 does not exist in ZCL
-            frame: ZclFrame.create(0, 0, true, null, 40, 0, 1, [{attrId: 0}, {attrId: 9999}]),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
@@ -3740,6 +3963,7 @@ describe('Controller', () => {
                 "_applicationVersion":2,
                 "_dateCode":"201901",
                 "_pendingRequestTimeout":0,
+                "_customClusters": {},
                 "_endpoints":[
                     {
                         "deviceID":5,
@@ -3769,7 +3993,6 @@ describe('Controller', () => {
                 "_lastSeen":150,
                 "_linkquality":19,
                 "_skipDefaultResponse": false,
-                "_skipTimeResponse": false,
                 "_manufacturerID":1212,
                 "_manufacturerName":"KoenAndCo",
                 "_modelID":"myModelID",
@@ -3830,11 +4053,14 @@ describe('Controller', () => {
     it('Emit write from device', async () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+        const frame = Zcl.Frame.create(0, 0, true, null, 40, 2, 10, [{attrId:16389, dataType:32, attrData:3}]);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
             // Attrid 9999 does not exist in ZCL
-            frame: ZclFrame.create(0, 0, true, null, 40, 2, 10, [{attrId:16389, dataType:32, attrData:3}]),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 10,
@@ -3848,6 +4074,7 @@ describe('Controller', () => {
                 "_applicationVersion":2,
                 "_dateCode":"201901",
                 "_pendingRequestTimeout":0,
+                "_customClusters": {},
                 "_endpoints":[
                     {
                         "meta":{},
@@ -3879,7 +4106,6 @@ describe('Controller', () => {
                 "_lastSeen":150,
                 "_linkquality":19,
                 "_skipDefaultResponse": false,
-                "_skipTimeResponse": false,
                 "_manufacturerID":1212,
                 "_manufacturerName":"KoenAndCo",
                 "_modelID":"myModelID",
@@ -3946,7 +4172,7 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error('timeout occurred'));
         let error;
         try {await endpoint.command('genOnOff', 'toggle', {})} catch (e) {error = e}
-        expect(error).toStrictEqual(new Error(`Command 0x129/1 genOnOff.toggle({}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":false,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
+        expect(error).toStrictEqual(new Error(`ZCL command 0x129/1 genOnOff.toggle({}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":false,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
     });
 
     it('Endpoint commandResponse error', async () => {
@@ -3979,7 +4205,7 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error('timeout occurred'));
         let error;
         try {await endpoint.configureReporting('genOnOff', [{attribute: 'onOff', minimumReportInterval: 0, maximumReportInterval: 2, reportableChange: 10}])} catch (e) {error = e}
-        expect(error).toStrictEqual(new Error(`ConfigureReporting 0x129/1 genOnOff([{"attribute":"onOff","minimumReportInterval":0,"maximumReportInterval":2,"reportableChange":10}], {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
+        expect(error).toStrictEqual(new Error(`ZCL command 0x129/1 genOnOff.configReport([{"attribute":"onOff","minimumReportInterval":0,"maximumReportInterval":2,"reportableChange":10}], {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
     });
 
     it('DefaultResponse error', async () => {
@@ -3990,7 +4216,7 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error('timeout occurred'));
         let error;
         try {await endpoint.defaultResponse(1, 0, 1, 3)} catch (e) {error = e}
-        expect(error).toStrictEqual(new Error(`DefaultResponse 0x129/1 1(1, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":1,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
+        expect(error).toStrictEqual(new Error(`ZCL command 0x129/1 genPowerCfg.defaultRsp({"cmdId":1,"statusCode":0}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":1,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":3,"writeUndiv":false}) failed (timeout occurred)`));
     });
 
     it('DefaultResponse error when transactionSequenceNumber provided through options', async () => {
@@ -4034,7 +4260,7 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error('timeout occurred'));
         let error;
         try {await endpoint.readResponse('genOnOff', 1, [{onOff: 1}])} catch (e) {error = e}
-        expect(error).toStrictEqual(new Error(`ReadResponse 0x129/1 genOnOff([{"onOff":1}], {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":1,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
+        expect(error).toStrictEqual(new Error(`ZCL command 0x129/1 genOnOff.readRsp([{"onOff":1}], {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":1,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":1,"writeUndiv":false}) failed (timeout occurred)`));
     });
 
     it('Read error', async () => {
@@ -4045,7 +4271,7 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error('timeout occurred'));
         let error;
         try {await endpoint.read('genOnOff', ['onOff'])} catch (e) {error = e}
-        expect(error).toStrictEqual(new Error(`Read 0x129/1 genOnOff(["onOff"], {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
+        expect(error).toStrictEqual(new Error(`ZCL command 0x129/1 genOnOff.read(["onOff"], {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
     });
 
     it('Read with disable response', async () => {
@@ -4067,7 +4293,7 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error('timeout occurred'));
         let error;
         try {await endpoint.write('genOnOff', {onOff: 1})} catch (e) {error = e}
-        expect(error).toStrictEqual(new Error(`Write 0x129/1 genOnOff({"onOff":1}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
+        expect(error).toStrictEqual(new Error(`ZCL command 0x129/1 genOnOff.write({"onOff":1}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
     });
 
     it('Write with disable response', async () => {
@@ -4122,7 +4348,7 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error('timeout occurred'));
         let error;
         try {await endpoint.writeStructured('genPowerCfg', {})} catch (e) {error = e}
-        expect(error).toStrictEqual(new Error(`WriteStructured 0x129/1 genPowerCfg({}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
+        expect(error).toStrictEqual(new Error(`ZCL command 0x129/1 genPowerCfg.writeStructured({}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
     });
 
     it('Green power', async () => {
@@ -4143,10 +4369,13 @@ describe('Controller', () => {
             },
         };
         const frame = mockZclFrame.create(1, 0, true, null, 10, 'commissioningNotification', 33, data)
-        await mockAdapterEvents['zclData']({
+        jest.spyOn(Zcl.Frame, 'fromBuffer').mockReturnValueOnce(frame); // Mock because no Buffalo write for 0xe0 is implemented
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: true,
             address: 0x46f4fe,
-            frame,
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 242,
             linkquality: 50,
             groupID: 1,
@@ -4168,19 +4397,22 @@ describe('Controller', () => {
         expect(mocksendZclFrameToAll).toHaveBeenCalledTimes(1);
 
         // When joins again, shouldnt emit duplicate event
-        await mockAdapterEvents['zclData']({
+        jest.spyOn(Zcl.Frame, 'fromBuffer').mockReturnValueOnce(frame); // Mock because no Buffalo write for 0xe0 is implemented
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: true,
             address: 0xf4fe,
-            frame,
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 242,
             linkquality: 50,
             groupID: 1,
         });
 
         expect(events.deviceJoined.length).toBe(1);
-        expect(deepClone(events.deviceJoined[0])).toStrictEqual({"device":{"ID":2,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_endpoints":[{"inputClusters":[],"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x000000000046f4fe","sendInProgress": false},"ID":242,"clusters":{},"deviceIeeeAddress":"0x000000000046f4fe","deviceNetworkAddress":0xf4fe,"_binds":[], "_configuredReportings": [],"_events":{},"_eventsCount":0,"meta":{}}],"_events":{},"_eventsCount":0,"_ieeeAddr":"0x000000000046f4fe","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_linkquality":50,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0xf4fe,"_type":"GreenPower","meta":{}}});
+        expect(deepClone(events.deviceJoined[0])).toStrictEqual({"device":{"ID":2,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_customClusters":{},"_endpoints":[{"inputClusters":[],"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x000000000046f4fe","sendInProgress": false},"ID":242,"clusters":{},"deviceIeeeAddress":"0x000000000046f4fe","deviceNetworkAddress":0xf4fe,"_binds":[], "_configuredReportings": [],"_events":{},"_eventsCount":0,"meta":{}}],"_events":{},"_eventsCount":0,"_ieeeAddr":"0x000000000046f4fe","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_linkquality":50,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0xf4fe,"_type":"GreenPower","meta":{}}});
         expect(events.deviceInterview.length).toBe(1);
-        expect(deepClone(events.deviceInterview[0])).toStrictEqual({"status":"successful","device":{"ID":2,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_endpoints":[],"_events":{},"_eventsCount":0,"_ieeeAddr":"0x000000000046f4fe","_interviewCompleted":true,"_interviewing":false,"_lastSeen":null,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0xf4fe,"_type":"GreenPower","meta":{}}});
+        expect(deepClone(events.deviceInterview[0])).toStrictEqual({"status":"successful","device":{"ID":2,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_customClusters":{},"_endpoints":[],"_events":{},"_eventsCount":0,"_ieeeAddr":"0x000000000046f4fe","_interviewCompleted":true,"_interviewing":false,"_lastSeen":null,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0xf4fe,"_type":"GreenPower","meta":{}}});
         expect((controller.getDeviceByIeeeAddr('0x000000000046f4fe')).networkAddress).toBe(0xf4fe);
         expect(events.message.length).toBe(2);
 
@@ -4197,20 +4429,53 @@ describe('Controller', () => {
             },
         };
         const frameToggle = mockZclFrame.create(1, 0, true, null, 10, 'notification', 33, dataToggle)
-        await mockAdapterEvents['zclData']({
+        jest.spyOn(Zcl.Frame, 'fromBuffer').mockReturnValueOnce(frameToggle); // Mock because no Buffalo write for 0x22 is implemented
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 0xf4fe,
-            frame: frameToggle,
+            clusterID: frameToggle.cluster.ID,
+            data: frameToggle.toBuffer(),
+            header: frameToggle.header,
             endpoint: 242,
             linkquality: 50,
             groupID: 1,
         });
 
         expect(events.message.length).toBe(1);
-        const expected = {"type":"commandNotification","device":{"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_endpoints":[{"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x000000000046f4fe","sendInProgress": false},"ID":242,"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x000000000046f4fe","deviceNetworkAddress":0xf4fe,"_binds":[], "_configuredReportings": []}],"_ieeeAddr":"0x000000000046f4fe","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_linkquality": 50,"_manufacturerID":null,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_modelID":"GreenPower_2","_networkAddress":0xf4fe,"_type":"GreenPower","meta":{}},"endpoint":{"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x000000000046f4fe","sendInProgress": false},"ID":242,"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x000000000046f4fe","deviceNetworkAddress":0xf4fe,"_binds":[], "_configuredReportings": []},"data":{"options":0,"srcID":0x46f4fe,"frameCounter":228,"commandID":34,"payloadSize":255,"commandFrame":{}},"linkquality":50,"groupID":1,"cluster":"greenPower","meta":{"zclTransactionSequenceNumber":10,"manufacturerCode":null,"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false}}};
+        const expected = {"type":"commandNotification","device":{"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_customClusters":{},"_endpoints":[{"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x000000000046f4fe","sendInProgress": false},"ID":242,"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x000000000046f4fe","deviceNetworkAddress":0xf4fe,"_binds":[], "_configuredReportings": []}],"_ieeeAddr":"0x000000000046f4fe","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_linkquality": 50,"_manufacturerID":null,"_skipDefaultResponse": false,"_modelID":"GreenPower_2","_networkAddress":0xf4fe,"_type":"GreenPower","meta":{}},"endpoint":{"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x000000000046f4fe","sendInProgress": false},"ID":242,"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x000000000046f4fe","deviceNetworkAddress":0xf4fe,"_binds":[], "_configuredReportings": []},"data":{"options":0,"srcID":0x46f4fe,"frameCounter":228,"commandID":34,"payloadSize":255,"commandFrame":{}},"linkquality":50,"groupID":1,"cluster":"greenPower","meta":{"zclTransactionSequenceNumber":10,"manufacturerCode":null,"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false}}};
         expect(deepClone(events.message[0])).toStrictEqual(expected);
 
         await mockAdapterEvents['']
+    });
+
+    it('Should handle comissioning frame gracefully', async () => {
+        await controller.start();
+        const buffer = Buffer.from([25,10,2,11,254,0]);
+        const frame = Zcl.Frame.fromBuffer(Zcl.Clusters.greenPower.ID, Zcl.Header.fromBuffer(buffer)!, buffer, {});
+        await mockAdapterEvents['zclPayload']({
+            wasBroadcast: true,
+            address: 0x46f4fe,
+            clusterID: frame.cluster.ID,
+            data: buffer,
+            header: frame.header,
+            endpoint: 242,
+            linkquality: 50,
+            groupID: 1,
+        });
+
+        expect(mockLogger.error).toHaveBeenCalledTimes(0);
+        expect(mockLogger.debug).toHaveBeenCalledWith(`Received unhandled command '0x2' from '4650238'`, `zh:controller:greenpower`);
+    });
+
+    it('Should ignore invalid green power frame', async () => {
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        device.addCustomCluster('myCustomCluster', {ID: 9123, commands: {}, commandsResponse: {}, attributes: {superAttribute: {ID: 0, type: Zcl.DataType.UINT8}}});
+        const buffer = Buffer.from([24,169,99,0,1,24,3,0,0,24,1]);
+        const header = Zcl.Header.fromBuffer(buffer);
+        await mockAdapterEvents['zclPayload']({wasBroadcast: false, address: 129, clusterID: 33, data: buffer, header, endpoint: 1, linkquality: 50, groupID: 1});
+        expect(events.message.length).toBe(0);
     });
 
     it('Green power channel request', async() => {
@@ -4229,11 +4494,14 @@ describe('Controller', () => {
                 nextNextChannel: 15,
             },
         };
-        const frame = mockZclFrame.create(1, 0, true, null, 10, 'commissioningNotification', 33, data)
-        await mockAdapterEvents['zclData']({
+        const frame = mockZclFrame.create(1, 0, true, null, 10, 'commissioningNotification', 33, data);
+        jest.spyOn(Zcl.Frame, 'fromBuffer').mockReturnValueOnce(frame); // Mock because no Buffalo write for 0xe3 is implemented
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: true,
             address: 0x46f4fe,
-            frame,
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 242,
             linkquality: 50,
             groupID: 1,
@@ -4278,11 +4546,14 @@ describe('Controller', () => {
                 outgoingCounter: 0x000004e4,
             },
         };
-        const frame = mockZclFrame.create(1, 0, true, null, 10, 'commissioningNotification', 33, data)
-        await mockAdapterEvents['zclData']({
+        const frame = mockZclFrame.create(1, 0, true, null, 10, 'commissioningNotification', 33, data);
+        jest.spyOn(Zcl.Frame, 'fromBuffer').mockReturnValueOnce(frame); // Mock because no Buffalo write for 0xe0 is implemented
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: true,
             address: 0x46f4fe,
-            frame,
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 242,
             linkquality: 50,
             groupID: 1,
@@ -4344,7 +4615,7 @@ describe('Controller', () => {
 
 
         const response = mockZclFrame.create(1, 1, true, null, 4, 'response', 33, payload);
-        
+
         expect(mocksendZclFrameToAll).toHaveBeenCalledTimes(1);
         expect(mocksendZclFrameToAll.mock.calls[0][0]).toBe(242);
         expect(deepClone(mocksendZclFrameToAll.mock.calls[0][1])).toStrictEqual(deepClone(response));
@@ -4380,16 +4651,19 @@ describe('Controller', () => {
             gppGddLink: 0xd8,
        };
 
-       const expectedFrame = mockZclFrame.create(1, 0, true, null, 100, 'commissioningNotification', 33, data);
+        const expectedFrame = mockZclFrame.create(1, 0, true, null, 100, 'commissioningNotification', 33, data);
 
-       const receivedFrame = ZclFrame.fromBuffer(33, Buffer.from([0x11, 0x64, 0x04, 0x00, 0x08, 0xf8, 0x71, 0x71, 0x01, 0xf8, 0x00, 0x00, 0x00, 0xe0, 0x2e, 0x02, 0xc5, 0xf2, 0x21, 0x7f, 0x8c, 0xb2, 0x90, 0xd9, 0x90, 0x14, 0x15, 0xd0, 0x5c, 0xb1, 0x64, 0x7c, 0x44, 0x6c, 0xfa, 0x47, 0x05, 0xf8, 0xf8, 0x11, 0x00, 0x00, 0x04, 0x11, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x22, 0x60, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x81, 0x00, 0xd8]));
+        const buffer = Buffer.from([0x11, 0x64, 0x04, 0x00, 0x08, 0xf8, 0x71, 0x71, 0x01, 0xf8, 0x00, 0x00, 0x00, 0xe0, 0x2e, 0x02, 0xc5, 0xf2, 0x21, 0x7f, 0x8c, 0xb2, 0x90, 0xd9, 0x90, 0x14, 0x15, 0xd0, 0x5c, 0xb1, 0x64, 0x7c, 0x44, 0x6c, 0xfa, 0x47, 0x05, 0xf8, 0xf8, 0x11, 0x00, 0x00, 0x04, 0x11, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x22, 0x60, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x81, 0x00, 0xd8]);
+        const receivedFrame = Zcl.Frame.fromBuffer(33, Zcl.Header.fromBuffer(buffer), buffer);
 
-       expect(deepClone(receivedFrame)).toStrictEqual(deepClone(expectedFrame));
-
-        await mockAdapterEvents['zclData']({
+        expect(deepClone(receivedFrame)).toStrictEqual(deepClone(expectedFrame));
+        jest.spyOn(Zcl.Frame, 'fromBuffer').mockReturnValueOnce(expectedFrame); // Mock because no Buffalo write for 0xe0 is implemented
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: expectedFrame,
+            clusterID: expectedFrame.cluster.ID,
+            data: expectedFrame.toBuffer(),
+            header: expectedFrame.header,
             endpoint: 242,
             linkquality: 50,
             groupID: 0,
@@ -4398,7 +4672,7 @@ describe('Controller', () => {
         const dataResponse = {
             options: 0x00e568,
             srcID: 0x017171f8,
-            sinkIEEEAddr: "0x123",
+            sinkIEEEAddr: "0x0000012300000000",
             sinkNwkAddr: 123,
             deviceID: 2,
             frameCounter: 4600,
@@ -4417,19 +4691,22 @@ describe('Controller', () => {
         expect(mocksendZclFrameToEndpoint.mock.calls[0][7]).toBe(242);
 
         // When joins again, shouldnt emit duplicate event
-        await mockAdapterEvents['zclData']({
+        jest.spyOn(Zcl.Frame, 'fromBuffer').mockReturnValueOnce(expectedFrame); // Mock because no Buffalo write for 0xe0 is implemented
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: expectedFrame,
+            clusterID: expectedFrame.cluster.ID,
+            data: expectedFrame.toBuffer(),
+            header: expectedFrame.header,
             endpoint: 242,
             linkquality: 50,
             groupID: 0,
         });
 
         expect(events.deviceJoined.length).toBe(1);
-        expect(deepClone(events.deviceJoined[0])).toStrictEqual({"device":{"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_endpoints":[{"ID":242,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x00000000017171f8","deviceNetworkAddress":0x71f8,"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x00000000017171f8","sendInProgress": false}}],"_ieeeAddr":"0x00000000017171f8","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_linkquality":50,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0x71f8,"_type":"GreenPower","meta":{}}});
+        expect(deepClone(events.deviceJoined[0])).toStrictEqual({"device":{"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_customClusters":{},"_endpoints":[{"ID":242,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x00000000017171f8","deviceNetworkAddress":0x71f8,"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x00000000017171f8","sendInProgress": false}}],"_ieeeAddr":"0x00000000017171f8","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_linkquality":50,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0x71f8,"_type":"GreenPower","meta":{}}});
         expect(events.deviceInterview.length).toBe(1);
-        expect(deepClone(events.deviceInterview[0])).toStrictEqual({"status":"successful","device":{"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_endpoints":[],"_ieeeAddr":"0x00000000017171f8","_interviewCompleted":true,"_interviewing":false,"_lastSeen":null,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0x71f8,"_type":"GreenPower","meta":{}}});
+        expect(deepClone(events.deviceInterview[0])).toStrictEqual({"status":"successful","device":{"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_customClusters":{},"_endpoints":[],"_ieeeAddr":"0x00000000017171f8","_interviewCompleted":true,"_interviewing":false,"_lastSeen":null,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0x71f8,"_type":"GreenPower","meta":{}}});
         expect((controller.getDeviceByIeeeAddr('0x00000000017171f8')).networkAddress).toBe(0x71f8);
         expect(events.message.length).toBe(2);
 
@@ -4448,17 +4725,19 @@ describe('Controller', () => {
             gppGddLink: 0xd8,
         };
         const frameScene = mockZclFrame.create(1, 0, true, null, 10, 'notification', 33, dataScene)
-        await mockAdapterEvents['zclData']({
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 0x017171f8,
-            frame: frameScene,
+            clusterID: frameScene.cluster.ID,
+            data: frameScene.toBuffer(),
+            header: frameScene.header,
             endpoint: 242,
             linkquality: 50,
             groupID: 0,
         });
 
         expect(events.message.length).toBe(1);
-        const expected = {"type":"commandNotification","device":{"ID":2,"_pendingRequestTimeout":0,"_endpoints":[{"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x00000000017171f8","sendInProgress": false},"ID":242,"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x00000000017171f8","deviceNetworkAddress":0x71f8,"_binds":[], "_configuredReportings": []}],"_events":{},"_eventsCount":0,"_ieeeAddr":"0x00000000017171f8","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_linkquality": 50,"_manufacturerID":null,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_modelID":"GreenPower_2","_networkAddress":0x71f8,"_type":"GreenPower","meta":{}},"endpoint":{"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x00000000017171f8","sendInProgress": false},"ID":242,"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x00000000017171f8","deviceNetworkAddress":0x71f8,"_binds":[], "_configuredReportings": []},"data":{"options":0x5488,"srcID":0x017171f8,"frameCounter":4601,"commandID":0x13,"payloadSize":0,"commandFrame":{},"gppNwkAddr": 129,"gppGddLink":0xd8},"linkquality":50,"groupID":0,"cluster":"greenPower","meta":{"zclTransactionSequenceNumber":10,"manufacturerCode":null,"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false}}};
+        const expected = {"type":"commandNotification","device":{"_events":{},"_eventsCount":0,"ID":2,"_type":"GreenPower","_ieeeAddr":"0x00000000017171f8","_networkAddress":29176,"_manufacturerID":null,"_customClusters":{},"_endpoints":[{"_events":{},"_eventsCount":0,"ID":242,"inputClusters":[],"outputClusters":[],"deviceNetworkAddress":29176,"deviceIeeeAddress":"0x00000000017171f8","clusters":{},"_binds":[],"_configuredReportings":[],"meta":{},"pendingRequests":{"sendInProgress":false,"ID":242,"deviceIeeeAddress":"0x00000000017171f8"}}],"_modelID":"GreenPower_2","_interviewCompleted":true,"_interviewing":false,"_skipDefaultResponse":false,"meta":{},"_lastSeen":150,"_pendingRequestTimeout":0,"_linkquality":50},"endpoint":{"_events":{},"_eventsCount":0,"ID":242,"inputClusters":[],"outputClusters":[],"deviceNetworkAddress":29176,"deviceIeeeAddress":"0x00000000017171f8","clusters":{},"_binds":[],"_configuredReportings":[],"meta":{},"pendingRequests":{"sendInProgress":false,"ID":242,"deviceIeeeAddress":"0x00000000017171f8"}},"data":{"options":21640,"srcID":24211960,"frameCounter":4601,"commandID":19,"payloadSize":0,"commandFrame":{"raw":{"type":"Buffer","data":[129,0,216]}},"gppNwkAddr":129,"gppGddLink":216},"linkquality":50,"groupID":0,"cluster":"greenPower","meta":{"zclTransactionSequenceNumber":10,"manufacturerCode":null,"frameControl":{"reservedBits":0,"frameType":1,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false}}};
         expect(deepClone(events.message[0])).toStrictEqual(expected);
 
         // Remove green power device from network
@@ -4475,22 +4754,25 @@ describe('Controller', () => {
         expect(deepClone(mocksendZclFrameToAll.mock.calls[0][1])).toStrictEqual(deepClone(removeFrame));
         expect(mocksendZclFrameToAll.mock.calls[0][2]).toBe(242);
         expect(mocksendZclFrameToAll).toHaveBeenCalledTimes(1);
-        expect(controller.getDeviceByIeeeAddr('0x00000000017171f8')).toBeUndefined(); 
+        expect(controller.getDeviceByIeeeAddr('0x00000000017171f8')).toBeUndefined();
 
         expect(Device.byIeeeAddr('0x00000000017171f8')).toBeUndefined();
-        expect(deepClone(Device.byIeeeAddr('0x00000000017171f8', true))).toStrictEqual({"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_endpoints":[{"ID":242,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x00000000017171f8","deviceNetworkAddress":0x71f8,"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x00000000017171f8","sendInProgress": false}}],"_ieeeAddr":"0x00000000017171f8","_interviewCompleted":false,"_interviewing":false,"_lastSeen":150,"_linkquality":50,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0x71f8,"_type":"GreenPower","_deleted":true,"meta":{}});
+        expect(deepClone(Device.byIeeeAddr('0x00000000017171f8', true))).toStrictEqual({"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_customClusters":{},"_endpoints":[{"ID":242,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x00000000017171f8","deviceNetworkAddress":0x71f8,"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x00000000017171f8","sendInProgress": false}}],"_ieeeAddr":"0x00000000017171f8","_interviewCompleted":false,"_interviewing":false,"_lastSeen":150,"_linkquality":50,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0x71f8,"_type":"GreenPower","_deleted":true,"meta":{}});
 
         // Re-add device
-        await mockAdapterEvents['zclData']({
+        jest.spyOn(Zcl.Frame, 'fromBuffer').mockReturnValueOnce(expectedFrame); // Mock because no Buffalo write for 0xe0 is implemented
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 129,
-            frame: expectedFrame,
+            clusterID: expectedFrame.cluster.ID,
+            data: expectedFrame.toBuffer(),
+            header: expectedFrame.header,
             endpoint: 242,
             linkquality: 50,
             groupID: 0,
         });
 
-        expect(deepClone(Device.byIeeeAddr('0x00000000017171f8'))).toStrictEqual({"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_skipTimeResponse":false,"_endpoints":[{"ID":242,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x00000000017171f8","deviceNetworkAddress":0x71f8,"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x00000000017171f8","sendInProgress": false}}],"_ieeeAddr":"0x00000000017171f8","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_linkquality":50,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0x71f8,"_type":"GreenPower","_deleted":false,"meta":{}});
+        expect(deepClone(Device.byIeeeAddr('0x00000000017171f8'))).toStrictEqual({"ID":2,"_events":{},"_eventsCount":0,"_pendingRequestTimeout":0,"_skipDefaultResponse": false,"_customClusters":{},"_endpoints":[{"ID":242,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"clusters":{},"deviceIeeeAddress":"0x00000000017171f8","deviceNetworkAddress":0x71f8,"inputClusters":[],"meta":{},"outputClusters":[],"pendingRequests": {"ID": 242,"deviceIeeeAddress": "0x00000000017171f8","sendInProgress": false}}],"_ieeeAddr":"0x00000000017171f8","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_linkquality":50,"_manufacturerID":null,"_modelID":"GreenPower_2","_networkAddress":0x71f8,"_type":"GreenPower","_deleted":false,"meta":{}});
     });
 
     it('Get input/ouptut clusters', async () => {
@@ -4510,12 +4792,12 @@ describe('Controller', () => {
         const endpoint = device.getEndpoint(1);
         const options = {manufacturerCode: 0x100B, disableDefaultResponse: true, timeout: 12, defaultResponseTimeout: 16};
         await endpoint.report('genBasic', {0x0031: {value: 0x000B, type: 0x19}}, options);
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(1);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         const call = mocksendZclFrameToEndpoint.mock.calls[0];
         expect(call[0]).toBe('0x129');
         expect(call[1]).toBe(129);
         expect(call[2]).toBe(1);
-        expect(deepClone(call[3])).toStrictEqual({"Header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4107,"commandIdentifier":10},"Payload":[{"attrId":49,"attrData":11,"dataType":25}],"Cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"Command":{"ID":10,"name":"report","parameters":[{"name":"attrId","type":33},{"name":"dataType","type":32},{"name":"attrData","type":1000}]}});
+        expect(deepClone(call[3])).toStrictEqual({"header":{"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":true},"transactionSequenceNumber":11,"manufacturerCode":4107,"commandIdentifier":10},"payload":[{"attrId":49,"attrData":11,"dataType":25}],"cluster":{"ID":0,"attributes":{"zclVersion":{"ID":0,"type":32,"name":"zclVersion"},"appVersion":{"ID":1,"type":32,"name":"appVersion"},"schneiderMeterRadioPower": {"ID": 57856,"manufacturerCode": 4190,"name": "schneiderMeterRadioPower","type": 40},"stackVersion":{"ID":2,"type":32,"name":"stackVersion"},"hwVersion":{"ID":3,"type":32,"name":"hwVersion"},"manufacturerName":{"ID":4,"type":66,"name":"manufacturerName"},"modelId":{"ID":5,"type":66,"name":"modelId"},"dateCode":{"ID":6,"type":66,"name":"dateCode"},"powerSource":{"ID":7,"type":48,"name":"powerSource"},"appProfileVersion":{"ID":8,"type":48,"name":"appProfileVersion"},"swBuildId":{"ID":16384,"type":66,"name":"swBuildId"},"locationDesc":{"ID":16,"type":66,"name":"locationDesc"},"physicalEnv":{"ID":17,"type":48,"name":"physicalEnv"},"develcoPrimaryHwVersion":{"ID": 32800,"manufacturerCode": 4117,"name": "develcoPrimaryHwVersion","type": 65,},"develcoPrimarySwVersion":{"ID": 32768,"manufacturerCode": 4117,"name": "develcoPrimarySwVersion","type": 65,},"develcoLedControl":{"ID":33024,"manufacturerCode":4117,"name":"develcoLedControl","type":24,},"deviceEnabled":{"ID":18,"type":16,"name":"deviceEnabled"},"alarmMask":{"ID":19,"type":24,"name":"alarmMask"},"disableLocalConfig":{"ID":20,"type":24,"name":"disableLocalConfig"}},"name":"genBasic","commands":{"resetFactDefault":{"ID":0,"parameters":[],"name":"resetFactDefault"},"tuyaSetup":{"ID":240,"parameters":[],"name":"tuyaSetup"}},"commandsResponse":{}},"command":{"ID":10,"name":"report","parameters":[{"name":"attrId","type":33},{"name":"dataType","type":32},{"name":"attrData","type":1000}]}});
         expect(call[4]).toBe(12);
     });
 
@@ -4528,7 +4810,7 @@ describe('Controller', () => {
         let error;
         try {await endpoint.report('genBasic', {'UNKNOWN': {value: 0x000B, type: 0x19}}) } catch (e) {error = e}
         expect(error).toStrictEqual(new Error(`Unknown attribute 'UNKNOWN', specify either an existing attribute or a number`))
-        expect(mocksendZclFrameToEndpoint).toBeCalledTimes(0);
+        expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
     });
 
     it('Report error', async () => {
@@ -4539,7 +4821,7 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error('timeout occurred'));
         let error;
         try {await endpoint.report('genOnOff', {onOff: 1})} catch (e) {error = e}
-        expect(error).toStrictEqual(new Error(`Report to 0x129/1 genOnOff({"onOff":1}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
+        expect(error).toStrictEqual(new Error(`ZCL command 0x129/1 genOnOff.report({"onOff":1}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
     });
 
     it('Write to device with pendingRequestTimeout > 0', async () => {
@@ -4563,24 +4845,28 @@ describe('Controller', () => {
         const result = endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true});
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
 
+        const buffer = Buffer.from([24,169,10,0,0,24,1]);
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Zcl.Header.fromBuffer(buffer), buffer);
         const data = {
             wasBroadcast: false,
             address: '0x129',
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
         }
         await nextTick;
-        await mockAdapterEvents['zclData'](data);
+        await mockAdapterEvents['zclPayload'](data);
         await result;
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
         expect((await result)).toBe(undefined);
-        await mockAdapterEvents['zclData'](data);
+        await mockAdapterEvents['zclPayload'](data);
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
     });
 
-    
+
     it('Write to device with pendingRequestTimeout > 0, override default sendPolicy', async () => {
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 174, ieeeAddr: '0x129'});
@@ -4595,7 +4881,7 @@ describe('Controller', () => {
         try {
             await endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true, sendPolicy: 'immediate'});
         } catch (error) {
-            expect(error.message).toStrictEqual(`Write 0x129/1 genOnOff({"onOff":1}, {"timeout":10000,"disableResponse":true,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false,"sendPolicy":"immediate"}) failed (Dogs barking too hard)`);
+            expect(error.message).toStrictEqual(`ZCL command 0x129/1 genOnOff.write({\"onOff\":1}, {"timeout":10000,"disableResponse":true,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false,"sendPolicy":"immediate"}) failed (Dogs barking too hard)`);
         }
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
         expect(endpoint.pendingRequests.size).toStrictEqual(1);
@@ -4623,7 +4909,7 @@ describe('Controller', () => {
             return f;
         };
         endpoint.pendingRequests.add(new Request(async () => {}, [], 100, undefined, undefined, () => {}, () => {}));
- 
+
         mocksendZclFrameToEndpoint.mockClear();
         mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Cats barking too hard');});
         mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Dogs barking too hard');});
@@ -4631,29 +4917,33 @@ describe('Controller', () => {
         const result = endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true});
         await nextTick;
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(1);
+        const buffer = Buffer.from([24,169,10,0,0,24,1]);
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Zcl.Header.fromBuffer(buffer), buffer);
         const data = {
             wasBroadcast: false,
             address: '0x129',
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
         }
 
         nextTick = new Promise (process.nextTick);
-        await mockAdapterEvents['zclData'](data);
+        await mockAdapterEvents['zclPayload'](data);
         await nextTick;
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
         Date.now.mockReturnValue(100000);
         let error = null;
         try{
-            await mockAdapterEvents['zclData'](data);
+            await mockAdapterEvents['zclPayload'](data);
             await result;
         } catch (e) {
             error = e;
         }
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(2);
-        expect(error.message).toStrictEqual(`Write 0x129/1 genOnOff({"onOff":1}, {"timeout":10000,"disableResponse":true,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (Dogs barking too hard)`);
+        expect(error.message).toStrictEqual(`ZCL command 0x129/1 genOnOff.write({\"onOff\":1}, {"timeout":10000,"disableResponse":true,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (Dogs barking too hard)`);
     });
 
     it('Write to device with pendingRequestTimeout > 0, replace queued messages', async () => {
@@ -4686,10 +4976,16 @@ describe('Controller', () => {
         mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Error eight')});
         mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {});
         mocksendZclFrameToEndpoint.mockImplementationOnce(async () => {throw new Error('Dogs barking too hard')});
-        mocksendZclFrameToEndpoint.mockReturnValueOnce( {frame: {Payload: new Array( {"attrId": 1, "attrData": "one", "status": 0})}});
-        mocksendZclFrameToEndpoint.mockReturnValueOnce( {frame: {Payload: new Array( {"attrId": 2, "attrData": "two", "status": 0})}});
-        mocksendZclFrameToEndpoint.mockReturnValueOnce( {frame: {Payload: new Array( {"attrId": 3, "attrData": "three", "status": 0})}});
-        mocksendZclFrameToEndpoint.mockReturnValueOnce( {frame: {Payload: new Array( {"attrId": 4, "attrData": "four", "status": 0})}});
+
+        const createResponse = (attrData: number) => {
+            const frame = mockZclFrame.create(0, 1, true, null, 10, 'readRsp', 'genOnOff', [{attrId: 16385, dataType: 33, attrData, status: 0}]);
+            return {clusterID: frame.cluster.ID, header: frame.header, data: frame.toBuffer()};;
+        }
+        mocksendZclFrameToEndpoint.mockReturnValueOnce(createResponse(1));
+        mocksendZclFrameToEndpoint.mockReturnValueOnce(createResponse(2));
+        mocksendZclFrameToEndpoint.mockReturnValueOnce(createResponse(3));
+        mocksendZclFrameToEndpoint.mockReturnValueOnce(createResponse(4));
+
         let result1, result2: Promise <any>;
         let nextTick = new Promise (process.nextTick);
         endpoint.write('genOnOff', {onOff: 0, startUpOnOff: 0}, {disableResponse: true});
@@ -4773,23 +5069,27 @@ describe('Controller', () => {
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(8);
 
         // Implicit checkin, there are 5 ZclFrames and 2 other requests left in the queue:
-        await mockAdapterEvents['zclData']({
+        const buffer = Buffer.from([24,169,10,0,0,24,1]);
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Zcl.Header.fromBuffer(buffer), buffer);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: '0x129',
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
         });
 
         await result4;
-        expect(result4).resolves.toStrictEqual({"3": "three"});
-        expect(result5).resolves.toStrictEqual({"3": "three"});
+        expect(result4).resolves.toStrictEqual({"onTime": 3});
+        expect(result5).resolves.toStrictEqual({"onTime": 3});
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(13);
-        expect(mocksendZclFrameToEndpoint.mock.calls[8][3].Payload).toStrictEqual ([{"attrData": 0, "attrId": 16387, "dataType": 48}]);
-        expect(mocksendZclFrameToEndpoint.mock.calls[9][3].Payload).toStrictEqual ([{"attrData": 1, "attrId": 0, "dataType": 16}]);
-        expect(mocksendZclFrameToEndpoint.mock.calls[10][3].Payload).toStrictEqual ([{"attrData": 0, "attrId": 0, "dataType": 16}, {"attrData": 0, "attrId": 16387, "dataType": 48}]);
-        expect(mocksendZclFrameToEndpoint.mock.calls[11][3].Payload).toStrictEqual ([{"attrData": 1, "attrId": 16387, "dataType": 48}]);
+        expect(mocksendZclFrameToEndpoint.mock.calls[8][3].payload).toStrictEqual ([{"attrData": 0, "attrId": 16387, "dataType": 48}]);
+        expect(mocksendZclFrameToEndpoint.mock.calls[9][3].payload).toStrictEqual ([{"attrData": 1, "attrId": 0, "dataType": 16}]);
+        expect(mocksendZclFrameToEndpoint.mock.calls[10][3].payload).toStrictEqual ([{"attrData": 0, "attrId": 0, "dataType": 16}, {"attrData": 0, "attrId": 16387, "dataType": 48}]);
+        expect(mocksendZclFrameToEndpoint.mock.calls[11][3].payload).toStrictEqual ([{"attrData": 1, "attrId": 16387, "dataType": 48}]);
     });
 
     it('Write to device with pendingRequestTimeout > 0, discard messages after expiration', async () => {
@@ -4811,11 +5111,14 @@ describe('Controller', () => {
         const origQueueRequest = endpoint.pendingRequests.queue;
         endpoint.pendingRequests.queue = async (req) => {
             const f = origQueueRequest.call(endpoint.pendingRequests, req);
-
-            await mockAdapterEvents['zclData']({
+            const buffer = Buffer.from([24,169,10,0,0,24,1]);
+            const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Zcl.Header.fromBuffer(buffer), buffer);
+            await mockAdapterEvents['zclPayload']({
                 wasBroadcast: false,
                 address: 174,
-                frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+                clusterID: frame.cluster.ID,
+                data: frame.toBuffer(),
+                header: frame.header,
                 endpoint: 1,
                 linkquality: 50,
                 groupID: 1,
@@ -4877,8 +5180,8 @@ describe('Controller', () => {
 
         // onZclData is called via mockAdapterEvents, but we need to wait until it has finished
         const origOnZclData = device.onZclData;
-        device.onZclData = async (payload, endpoint) => {
-            const f = origOnZclData.call(device, payload, endpoint);
+        device.onZclData = async (a, b, c) => {
+            const f = origOnZclData.call(device, a, b, c);
             jest.advanceTimersByTime(10);
             return f;
         };
@@ -4887,10 +5190,14 @@ describe('Controller', () => {
         const result = endpoint.write('genOnOff', {onOff: 1}, {disableResponse: true, sendPolicy:'bulk'});
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
 
-        await mockAdapterEvents['zclData']({
+        const buffer = Buffer.from([24,169,10,0,0,24,1]);
+        let frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Zcl.Header.fromBuffer(buffer), buffer);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 174,
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("msOccupancySensing").ID, Buffer.from([24,169,10,0,0,24,1])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 1,
@@ -4899,10 +5206,13 @@ describe('Controller', () => {
 
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(0);
 
-        await mockAdapterEvents['zclData']({
+        frame = Zcl.Frame.create(Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, true, 1, 1, 'checkin', Zcl.Utils.getCluster("genPollCtrl").ID, {}, 0);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 174,
-            frame: ZclFrame.create(Zcl.FrameType.SPECIFIC, Zcl.Direction.SERVER_TO_CLIENT, true, 1, 1, 'checkin', Zcl.Utils.getCluster("genPollCtrl").ID, {}, 0),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 52,
             groupID: undefined,
@@ -4914,9 +5224,9 @@ describe('Controller', () => {
         expect(checkinrsp[0]).toBe('0x174');
         expect(checkinrsp[1]).toBe(174);
         expect(checkinrsp[2]).toBe(1);
-        expect(checkinrsp[3].Cluster.name).toBe('genPollCtrl');
-        expect(checkinrsp[3].Command.name).toBe('checkinRsp');
-        expect(checkinrsp[3].Payload).toStrictEqual({startFastPolling: true, fastPollTimeout: 0});
+        expect(checkinrsp[3].cluster.name).toBe('genPollCtrl');
+        expect(checkinrsp[3].command.name).toBe('checkinRsp');
+        expect(checkinrsp[3].payload).toStrictEqual({startFastPolling: true, fastPollTimeout: 0});
 
         expect((await result)).toBe(undefined);
 
@@ -4924,7 +5234,7 @@ describe('Controller', () => {
         expect(cmd[0]).toBe('0x174');
         expect(cmd[1]).toBe(174);
         expect(cmd[2]).toBe(1);
-        expect(cmd[3].Cluster.name).toBe('genOnOff');
+        expect(cmd[3].cluster.name).toBe('genOnOff');
 
         await nextTick;
         expect(mocksendZclFrameToEndpoint).toHaveBeenCalledTimes(3);
@@ -4932,9 +5242,9 @@ describe('Controller', () => {
         expect(fastpollstop[0]).toBe('0x174');
         expect(fastpollstop[1]).toBe(174);
         expect(fastpollstop[2]).toBe(1);
-        expect(fastpollstop[3].Cluster.name).toBe('genPollCtrl');
-        expect(fastpollstop[3].Command.name).toBe('fastPollStop');
-        expect(fastpollstop[3].Payload).toStrictEqual({});
+        expect(fastpollstop[3].cluster.name).toBe('genPollCtrl');
+        expect(fastpollstop[3].command.name).toBe('fastPollStop');
+        expect(fastpollstop[3].payload).toStrictEqual({});
     });
 
     it('Handle retransmitted Xiaomi messages', async () => {
@@ -4942,17 +5252,20 @@ describe('Controller', () => {
         await mockAdapterEvents['deviceJoined']({networkAddress: 175, ieeeAddr: '0x175'});
         await mockAdapterEvents['deviceJoined']({networkAddress: 171, ieeeAddr: '0x171'});
 
-        await mockAdapterEvents['zclData']({
+        const frame = Zcl.Frame.create(0, 0, true, null, 40, 0, 1, [{attrId: 0}, {attrId: 9999}]);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: 175,
             // Attrid 9999 does not exist in ZCL
-            frame: ZclFrame.create(0, 0, true, null, 40, 0, 1, [{attrId: 0}, {attrId: 9999}]),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 19,
             groupID: 171,
         });
 
-        const expected = {"type":"read","device":{"ID":3,"_applicationVersion":2,"_dateCode":"201901","_pendingRequestTimeout":0,"_endpoints":[{"deviceID":5,"inputClusters":[0,1,2],"outputClusters":[2],"profileID":99,"ID":1,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x171","sendInProgress": false}},{"inputClusters":[],"outputClusters":[],"ID":2,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 2,"deviceIeeeAddress": "0x171","sendInProgress": false}},{"inputClusters":[],"outputClusters":[],"ID":3,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 3,"deviceIeeeAddress": "0x171","sendInProgress": false}},{"inputClusters":[],"outputClusters":[],"ID":4,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 4,"deviceIeeeAddress": "0x171","sendInProgress": false}},{"inputClusters":[],"outputClusters":[],"ID":5,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 5,"deviceIeeeAddress": "0x171","sendInProgress": false}},{"inputClusters":[],"outputClusters":[],"ID":6,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 6,"deviceIeeeAddress": "0x171","sendInProgress": false}}],"_events":{},"_eventsCount":0,"_hardwareVersion":3,"_events":{},"_eventsCount":0,"_ieeeAddr":"0x171","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_manufacturerID":1212,"_manufacturerName":"Xioami","_modelID":"lumi.remote.b286opcn01","_networkAddress":171,"_powerSource":"Mains (single phase)","_softwareBuildID":"1.01","_stackVersion":101,"_type":"EndDevice","_zclVersion":1,"_linkquality":19,"_skipDefaultResponse":false,"_skipTimeResponse":false,"meta":{}},"endpoint":{"deviceID":5,"inputClusters":[0,1,2],"outputClusters":[2],"profileID":99,"ID":1,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x171","sendInProgress": false}},"data":["mainsVoltage",9999],"linkquality":19,"groupID":171,"cluster":"genPowerCfg","meta":{"zclTransactionSequenceNumber":40,"manufacturerCode":null,"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false}}};
+        const expected = {"type":"read","device":{"ID":3,"_applicationVersion":2,"_dateCode":"201901","_pendingRequestTimeout":0,"_customClusters":{},"_endpoints":[{"deviceID":5,"inputClusters":[0,1,2],"outputClusters":[2],"profileID":99,"ID":1,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x171","sendInProgress": false}},{"inputClusters":[],"outputClusters":[],"ID":2,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 2,"deviceIeeeAddress": "0x171","sendInProgress": false}},{"inputClusters":[],"outputClusters":[],"ID":3,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 3,"deviceIeeeAddress": "0x171","sendInProgress": false}},{"inputClusters":[],"outputClusters":[],"ID":4,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 4,"deviceIeeeAddress": "0x171","sendInProgress": false}},{"inputClusters":[],"outputClusters":[],"ID":5,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 5,"deviceIeeeAddress": "0x171","sendInProgress": false}},{"inputClusters":[],"outputClusters":[],"ID":6,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 6,"deviceIeeeAddress": "0x171","sendInProgress": false}}],"_events":{},"_eventsCount":0,"_hardwareVersion":3,"_events":{},"_eventsCount":0,"_ieeeAddr":"0x171","_interviewCompleted":true,"_interviewing":false,"_lastSeen":150,"_manufacturerID":1212,"_manufacturerName":"Xioami","_modelID":"lumi.remote.b286opcn01","_networkAddress":171,"_powerSource":"Mains (single phase)","_softwareBuildID":"1.01","_stackVersion":101,"_type":"EndDevice","_zclVersion":1,"_linkquality":19,"_skipDefaultResponse":false,"meta":{}},"endpoint":{"deviceID":5,"inputClusters":[0,1,2],"outputClusters":[2],"profileID":99,"ID":1,"clusters":{},"deviceIeeeAddress":"0x171","deviceNetworkAddress":171,"_binds":[],"_configuredReportings":[],"_events":{},"_eventsCount":0,"meta":{},"pendingRequests": {"ID": 1,"deviceIeeeAddress": "0x171","sendInProgress": false}},"data":["mainsVoltage",9999],"linkquality":19,"groupID":171,"cluster":"genPowerCfg","meta":{"zclTransactionSequenceNumber":40,"manufacturerCode":null,"frameControl":{"reservedBits":0,"frameType":0,"direction":0,"disableDefaultResponse":true,"manufacturerSpecific":false}}};
         expect(events.message.length).toBe(1);
         expect(deepClone(events.message[0])).toStrictEqual(expected);
     });
@@ -4975,12 +5288,17 @@ describe('Controller', () => {
     // ZCLFrame with manufacturer specific flag and manufacturer code defined, to generic device
     // ZCLFrameConverter should not modify specific frames!
     it('Should resolve manufacturer specific cluster attribute names on specific ZCL frames: generic target device', async () => {
+        const buffer = Buffer.from([28,33,16,13,1,2,240,0,48,4]);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("closuresWindowCovering").ID, Zcl.Header.fromBuffer(buffer), buffer);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: '0x129',
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("closuresWindowCovering").ID, Buffer.from([28,33,16,13,1,2,240,0,48,4])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 0,
@@ -4993,12 +5311,16 @@ describe('Controller', () => {
     // ZCLFrame with manufacturer specific flag and manufacturer code defined, to specific device
     // ZCLFrameConverter should not modify specific frames!
     it('Should resolve manufacturer specific cluster attribute names on specific ZCL frames: specific target device', async () => {
+        const buffer = Buffer.from([28,33,16,13,1,2,240,0,48,4]);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 177, ieeeAddr: '0x177'});
-        await mockAdapterEvents['zclData']({
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("closuresWindowCovering").ID, Zcl.Header.fromBuffer(buffer), buffer);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: '0x177',
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("closuresWindowCovering").ID, Buffer.from([28,33,16,13,1,2,240,0,48,4])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 0,
@@ -5010,12 +5332,16 @@ describe('Controller', () => {
 
     // ZCLFrame without manufacturer specific flag or manufacturer code set, to generic device
     it('Should resolve generic cluster attribute names on generic ZCL frames: generic target device', async () => {
+        const buffer = Buffer.from([24,242,10,2,240,48,4]);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
-        await mockAdapterEvents['zclData']({
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("closuresWindowCovering").ID, Zcl.Header.fromBuffer(buffer), buffer);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: '0x129',
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("closuresWindowCovering").ID, Buffer.from([24,242,10,2,240,48,4])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 0,
@@ -5027,12 +5353,16 @@ describe('Controller', () => {
 
     // ZCLFrame without manufacturer specific flag set or manufacturer code set, to specific device (Legrand only)
     it('Should resolve manufacturer specific cluster attribute names on generic ZCL frames: Legrand target device', async () => {
+        const buffer = Buffer.from([24,242,10,2,240,48,4]);
         await controller.start();
         await mockAdapterEvents['deviceJoined']({networkAddress: 177, ieeeAddr: '0x177'});
-        await mockAdapterEvents['zclData']({
+        const frame = Zcl.Frame.fromBuffer(Zcl.Utils.getCluster("closuresWindowCovering").ID, Zcl.Header.fromBuffer(buffer), buffer);
+        await mockAdapterEvents['zclPayload']({
             wasBroadcast: false,
             address: '0x177',
-            frame: ZclFrame.fromBuffer(Zcl.Utils.getCluster("closuresWindowCovering").ID, Buffer.from([24,242,10,2,240,48,4])),
+            clusterID: frame.cluster.ID,
+            data: frame.toBuffer(),
+            header: frame.header,
             endpoint: 1,
             linkquality: 50,
             groupID: 0,
@@ -5040,6 +5370,30 @@ describe('Controller', () => {
         expect(events.message.length).toBe(1);
         expect(events.message[0].data).toMatchObject({calibrationMode:4});
         expect(events.message[0].data).not.toMatchObject({tuyaMotorReversal:4});
+    });
+
+    it('zclCommand', async () => {
+        await controller.start();
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        const endpoint = device.getEndpoint(1);
+        mocksendZclFrameToEndpoint.mockReturnValueOnce(null);
+        let error;
+        try {await endpoint.zclCommand('genOnOff', 'discover', {startAttrId: 1, maxAttrIds: 255})} catch (e) {error = e}
+        expect(error).toBeUndefined();
+    });
+
+    it('zclCommand with error', async () => {
+        await controller.start();
+        await controller.start();
+        await mockAdapterEvents['deviceJoined']({networkAddress: 129, ieeeAddr: '0x129'});
+        const device = controller.getDeviceByIeeeAddr('0x129');
+        const endpoint = device.getEndpoint(1);
+        mocksendZclFrameToEndpoint.mockRejectedValueOnce(new Error('timeout occurred'));
+        let error;
+        try {await endpoint.zclCommand('genOnOff', 'discover', {startAttrId: 1, maxAttrIds: 255})} catch (e) {error = e}
+        expect(error).toStrictEqual(new Error(`ZCL command 0x129/1 genOnOff.discover({"startAttrId":1,"maxAttrIds":255}, {"timeout":10000,"disableResponse":false,"disableRecovery":false,"disableDefaultResponse":true,"direction":0,"srcEndpoint":null,"reservedBits":0,"manufacturerCode":null,"transactionSequenceNumber":null,"writeUndiv":false}) failed (timeout occurred)`));
     });
 });
 

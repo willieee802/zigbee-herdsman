@@ -4,21 +4,21 @@ import {
     ActiveEndpoints, SimpleDescriptor, LQI, RoutingTable, NetworkParameters,
     StartResult, LQINeighbor, RoutingTableEntry, AdapterOptions
 } from '../../tstype';
-import Debug from "debug";
 import Adapter from '../../adapter';
 
-const debug = Debug("zigbee-herdsman:adapter:ezsp:debg");
 import {Driver, EmberIncomingMessage} from '../driver';
 import {EmberZDOCmd, uint16_t, EmberEUI64, EmberStatus} from '../driver/types';
-import {ZclFrame, FrameType, Direction, Foundation} from '../../../zcl';
+import * as Zcl from '../../../zspec/zcl';
 import * as Events from '../../events';
 import {Queue, Waitress, Wait, RealpathSync} from '../../../utils';
 import * as Models from "../../../models";
 import SerialPortUtils from '../../serialPortUtils';
 import SocketPortUtils from '../../socketPortUtils';
 import {EZSPZDOResponseFrameData} from '../driver/ezsp';
-import {LoggerStub} from "../../../controller/logger-stub";
+import {logger} from '../../../utils/logger';
+import {BroadcastAddress} from '../../../zspec/enums';
 
+const NS = 'zh:ezsp';
 
 const autoDetectDefinitions = [
     {manufacturer: 'ITEAD', vendorId: '1a86', productId: '55d4'},  // Sonoff ZBDongle-E
@@ -36,29 +36,28 @@ interface WaitressMatcher {
 
 class EZSPAdapter extends Adapter {
     private driver: Driver;
-    private waitress: Waitress<Events.ZclDataPayload, WaitressMatcher>;
+    private waitress: Waitress<Events.ZclPayload, WaitressMatcher>;
     private interpanLock: boolean;
     private queue: Queue;
     private closing: boolean;
+    private deprecatedTimer: NodeJS.Timeout;
 
 
     public constructor(networkOptions: NetworkOptions,
-        serialPortOptions: SerialPortOptions, backupPath: string, adapterOptions: AdapterOptions,
-        logger?: LoggerStub) {
-        super(networkOptions, serialPortOptions, backupPath, adapterOptions, logger);
+        serialPortOptions: SerialPortOptions, backupPath: string, adapterOptions: AdapterOptions) {
+        super(networkOptions, serialPortOptions, backupPath, adapterOptions);
 
-        this.waitress = new Waitress<Events.ZclDataPayload, WaitressMatcher>(
+        this.waitress = new Waitress<Events.ZclPayload, WaitressMatcher>(
             this.waitressValidator, this.waitressTimeoutFormatter
         );
         this.interpanLock = false;
         this.closing = false;
 
         const concurrent = adapterOptions && adapterOptions.concurrent ? adapterOptions.concurrent : 8;
-        debug(`Adapter concurrent: ${concurrent}`);
+        logger.debug(`Adapter concurrent: ${concurrent}`, NS);
         this.queue = new Queue(concurrent);
 
-        this.driver = new Driver(this.serialPortOptions, this.networkOptions, this.greenPowerGroup,
-            backupPath, this.logger);
+        this.driver = new Driver(this.serialPortOptions, this.networkOptions, this.greenPowerGroup, backupPath);
         this.driver.on('close', this.onDriverClose.bind(this));
         this.driver.on('deviceJoined', this.handleDeviceJoin.bind(this));
         this.driver.on('deviceLeft', this.handleDeviceLeft.bind(this));
@@ -66,7 +65,7 @@ class EZSPAdapter extends Adapter {
     }
 
     private async processMessage(frame: EmberIncomingMessage): Promise<void> {
-        debug(`processMessage: ${JSON.stringify(frame)}`);
+        logger.debug(`processMessage: ${JSON.stringify(frame)}`, NS);
         if (frame.apsFrame.profileId == 0) {
             if (
                 frame.apsFrame.clusterId == EmberZDOCmd.Device_annce &&
@@ -76,40 +75,29 @@ class EZSPAdapter extends Adapter {
                 [nwk, rst] = uint16_t.deserialize(uint16_t, frame.message.subarray(1));
                 [ieee, rst] = EmberEUI64.deserialize(EmberEUI64, rst as Buffer);
                 ieee = new EmberEUI64(ieee);
-                debug("ZDO Device announce: %s, %s", nwk, ieee.toString());
+                logger.debug(`ZDO Device announce: ${nwk}, ${ieee.toString()}`, NS);
                 this.driver.handleNodeJoined(nwk, ieee);
             }
         } else if (frame.apsFrame.profileId == 260 || frame.apsFrame.profileId == 0xFFFF) {
-            try {
-                const payload: Events.ZclDataPayload = {
-                    frame: ZclFrame.fromBuffer(frame.apsFrame.clusterId, frame.message),
-                    address: frame.sender,
-                    endpoint: frame.apsFrame.sourceEndpoint,
-                    linkquality: frame.lqi,
-                    groupID: frame.apsFrame.groupId,
-                    wasBroadcast: false, // TODO
-                    destinationEndpoint: frame.apsFrame.destinationEndpoint,
-                };
+            const payload: Events.ZclPayload = {
+                clusterID: frame.apsFrame.clusterId,
+                header: Zcl.Header.fromBuffer(frame.message),
+                data: frame.message,
+                address: frame.sender,
+                endpoint: frame.apsFrame.sourceEndpoint,
+                linkquality: frame.lqi,
+                groupID: frame.apsFrame.groupId,
+                wasBroadcast: false, // TODO
+                destinationEndpoint: frame.apsFrame.destinationEndpoint,
+            };
 
-                this.waitress.resolve(payload);
-                this.emit(Events.Events.zclData, payload);
-            } catch (error) {
-                const payload: Events.RawDataPayload = {
-                    clusterID: frame.apsFrame.clusterId,
-                    data: frame.message,
-                    address: frame.sender,
-                    endpoint: frame.apsFrame.sourceEndpoint,
-                    linkquality: frame.lqi,
-                    groupID: frame.apsFrame.groupId,
-                    wasBroadcast: false, // TODO
-                    destinationEndpoint: frame.apsFrame.destinationEndpoint,
-                };
-
-                this.emit(Events.Events.rawData, payload);
-            }
+            this.waitress.resolve(payload);
+            this.emit(Events.Events.zclPayload, payload);
         } else if (frame.apsFrame.profileId == 0xc05e && frame.senderEui64) {  // ZLL Frame
-            const payload: Events.ZclDataPayload = {
-                frame: ZclFrame.fromBuffer(frame.apsFrame.clusterId, frame.message),
+            const payload: Events.ZclPayload = {
+                clusterID: frame.apsFrame.clusterId,
+                header: Zcl.Header.fromBuffer(frame.message),
+                data: frame.message,
                 address: `0x${frame.senderEui64.toString()}`,
                 endpoint: 0xFE,
                 linkquality: frame.lqi,
@@ -119,19 +107,16 @@ class EZSPAdapter extends Adapter {
             };
 
             this.waitress.resolve(payload);
-            this.emit(Events.Events.zclData, payload);
+            this.emit(Events.Events.zclPayload, payload);
         } else if (frame.apsFrame.profileId == 0xA1E0) {  // GP Frame
             // Only handle when clusterId == 33 (greenPower), some devices send messages with this profileId
             // while the cluster is not greenPower
             // https://github.com/Koenkk/zigbee2mqtt/issues/20838
             if (frame.apsFrame.clusterId === 33) {
-                const zclFrame = ZclFrame.create(
-                    FrameType.SPECIFIC, Direction.CLIENT_TO_SERVER, true,
-                    null, frame.apsFrame.sequence,
-                    (frame.messageType == 0xE0) ? 'commissioningNotification' : 'notification',
-                    frame.apsFrame.clusterId, frame.message);
-                const payload: Events.ZclDataPayload = {
-                    frame: zclFrame,
+                const payload: Events.ZclPayload = {
+                    header: Zcl.Header.fromBuffer(frame.message),
+                    clusterID: frame.apsFrame.clusterId,
+                    data: frame.message,
                     address: frame.sender,
                     endpoint: frame.apsFrame.sourceEndpoint,
                     linkquality: frame.lqi,
@@ -141,9 +126,9 @@ class EZSPAdapter extends Adapter {
                 };
     
                 this.waitress.resolve(payload);
-                this.emit(Events.Events.zclData, payload);
+                this.emit(Events.Events.zclPayload, payload);
             } else {
-                debug(`Ignoring GP frame because clusterId is not greenPower`);
+                logger.debug(`Ignoring GP frame because clusterId is not greenPower`, NS);
             }
         }
         this.emit('event', frame);
@@ -152,7 +137,7 @@ class EZSPAdapter extends Adapter {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private async handleDeviceJoin(arr: any[]): Promise<void> {
         const [nwk, ieee] = arr;
-        debug('Device join request received: %s %s', nwk, ieee.toString('hex'));
+        logger.debug(`Device join request received: ${nwk} ${ieee.toString('hex')}`, NS);
         const payload: Events.DeviceJoinedPayload = {
             networkAddress: nwk,
             ieeeAddr: `0x${ieee.toString('hex')}`,
@@ -168,7 +153,7 @@ class EZSPAdapter extends Adapter {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     private handleDeviceLeft(arr: any[]): void {
         const [nwk, ieee] = arr;
-        debug('Device left network request received: %s %s', nwk, ieee);
+        logger.debug(`Device left network request received: ${nwk} ${ieee}`, NS);
 
         const payload: Events.DeviceLeavePayload = {
             networkAddress: nwk,
@@ -181,16 +166,24 @@ class EZSPAdapter extends Adapter {
      * Adapter methods
      */
     public async start(): Promise<StartResult> {
+        const logEzspDeprecated = (): void => {
+            const message = `Deprecated driver 'ezsp' currently in use, 'ember' will become the officially supported EmberZNet ` +
+                `driver in next release. If using Zigbee2MQTT see https://github.com/Koenkk/zigbee2mqtt/discussions/21462`;
+            logger.warning(message, NS);
+        };
+        logEzspDeprecated();
+        this.deprecatedTimer = setInterval(logEzspDeprecated, 60 * 60 * 1000); // Every 60 mins
         return this.driver.startup();
     }
 
     public async stop(): Promise<void> {
         this.closing = true;
+        clearInterval(this.deprecatedTimer);
         await this.driver.stop();
     }
 
     public async onDriverClose(): Promise<void> {
-        debug(`onDriverClose()`);
+        logger.debug(`onDriverClose()`, NS);
 
         if (!this.closing) {
             this.emit(Events.Events.disconnected);
@@ -206,7 +199,7 @@ class EZSPAdapter extends Adapter {
         try {
             return SerialPortUtils.is(RealpathSync(path), autoDetectDefinitions);
         } catch (error) {
-            debug(`Failed to determine if path is valid: '${error}'`);
+            logger.debug(`Failed to determine if path is valid: '${error}'`, NS);
             return false;
         }
     }
@@ -383,11 +376,11 @@ class EZSPAdapter extends Adapter {
         return this.queue.execute<NodeDescriptor>(async () => {
             this.checkInterpanLock();
             try {
-                debug(`Requesting 'Node Descriptor' for '${networkAddress}'`);
+                logger.debug(`Requesting 'Node Descriptor' for '${networkAddress}'`, NS);
                 const result = await this.nodeDescriptorInternal(networkAddress);
                 return result;
             } catch (error) {
-                debug(`Node descriptor request for '${networkAddress}' failed (${error}), retry`);
+                logger.debug(`Node descriptor request for '${networkAddress}' failed (${error}), retry`, NS);
                 throw error;
             }
         });
@@ -406,7 +399,7 @@ class EZSPAdapter extends Adapter {
     }
 
     public async activeEndpoints(networkAddress: number): Promise<ActiveEndpoints> {
-        debug(`Requesting 'Active endpoints' for '${networkAddress}'`);
+        logger.debug(`Requesting 'Active endpoints' for '${networkAddress}'`, NS);
         return this.queue.execute<ActiveEndpoints>(async () => {
             const endpoints = await this.driver.zdoRequest(
                 networkAddress, EmberZDOCmd.Active_EP_req, EmberZDOCmd.Active_EP_rsp,
@@ -417,7 +410,7 @@ class EZSPAdapter extends Adapter {
     }
 
     public async simpleDescriptor(networkAddress: number, endpointID: number): Promise<SimpleDescriptor> {
-        debug(`Requesting 'Simple Descriptor' for '${networkAddress}' endpoint ${endpointID}`);
+        logger.debug(`Requesting 'Simple Descriptor' for '${networkAddress}' endpoint ${endpointID}`, NS);
         return this.queue.execute<SimpleDescriptor>(async () => {
             this.checkInterpanLock();
             const descriptor = await this.driver.zdoRequest(
@@ -435,10 +428,10 @@ class EZSPAdapter extends Adapter {
     }
 
     public async sendZclFrameToEndpoint(
-        ieeeAddr: string, networkAddress: number, endpoint: number, zclFrame: ZclFrame, timeout: number,
+        ieeeAddr: string, networkAddress: number, endpoint: number, zclFrame: Zcl.Frame, timeout: number,
         disableResponse: boolean, disableRecovery: boolean, sourceEndpoint?: number,
-    ): Promise<Events.ZclDataPayload> {
-        return this.queue.execute<Events.ZclDataPayload>(async () => {
+    ): Promise<Events.ZclPayload> {
+        return this.queue.execute<Events.ZclPayload>(async () => {
             this.checkInterpanLock();
             return this.sendZclFrameToEndpointInternal(
                 ieeeAddr, networkAddress, endpoint, sourceEndpoint || 1, zclFrame, timeout, disableResponse,
@@ -448,32 +441,32 @@ class EZSPAdapter extends Adapter {
     }
 
     private async sendZclFrameToEndpointInternal(
-        ieeeAddr: string, networkAddress: number, endpoint: number, sourceEndpoint: number, zclFrame: ZclFrame,
+        ieeeAddr: string, networkAddress: number, endpoint: number, sourceEndpoint: number, zclFrame: Zcl.Frame,
         timeout: number, disableResponse: boolean, disableRecovery: boolean, responseAttempt: number,
         dataRequestAttempt: number, checkedNetworkAddress: boolean, discoveredRoute: boolean, assocRemove: boolean,
         assocRestore: { ieeeadr: string, nwkaddr: number, noderelation: number }
-    ): Promise<Events.ZclDataPayload> {
+    ): Promise<Events.ZclPayload> {
         if (ieeeAddr == null) {
             ieeeAddr = `0x${this.driver.ieee.toString()}`;
         }
-        debug('sendZclFrameToEndpointInternal %s:%i/%i (%i,%i,%i), timeout=%i',
-            ieeeAddr, networkAddress, endpoint, responseAttempt, dataRequestAttempt, this.queue.count(), timeout);
+        logger.debug(`sendZclFrameToEndpointInternal ${ieeeAddr}:${networkAddress}/${endpoint} `
+            + `(${responseAttempt},${dataRequestAttempt},${this.queue.count()}), timeout=${timeout}`, NS);
         let response = null;
-        const command = zclFrame.getCommand();
+        const command = zclFrame.command;
         if (command.hasOwnProperty('response') && disableResponse === false) {
             response = this.waitForInternal(
                 networkAddress, endpoint,
-                zclFrame.Header.transactionSequenceNumber, zclFrame.Cluster.ID, command.response, timeout
+                zclFrame.header.transactionSequenceNumber, zclFrame.cluster.ID, command.response, timeout
             );
-        } else if (!zclFrame.Header.frameControl.disableDefaultResponse) {
+        } else if (!zclFrame.header.frameControl.disableDefaultResponse) {
             response = this.waitForInternal(
                 networkAddress, endpoint,
-                zclFrame.Header.transactionSequenceNumber, zclFrame.Cluster.ID, Foundation.defaultRsp.ID,
+                zclFrame.header.transactionSequenceNumber, zclFrame.cluster.ID, Zcl.Foundation.defaultRsp.ID,
                 timeout,
             );
         }
 
-        const frame = this.driver.makeApsFrame(zclFrame.Cluster.ID, disableResponse || zclFrame.Header.frameControl.disableDefaultResponse);
+        const frame = this.driver.makeApsFrame(zclFrame.cluster.ID, disableResponse || zclFrame.header.frameControl.disableDefaultResponse);
         frame.profileId = 0x0104;
         frame.sourceEndpoint = sourceEndpoint || 0x01;
         frame.destinationEndpoint = endpoint;
@@ -492,7 +485,7 @@ class EZSPAdapter extends Adapter {
                 const result = await response.start().promise;
                 return result;
             } catch (error) {
-                debug('Response timeout (%s:%d,%d)', ieeeAddr, networkAddress, responseAttempt);
+                logger.debug(`Response timeout (${ieeeAddr}:${networkAddress},${responseAttempt})`, NS);
                 if (responseAttempt < 1 && !disableRecovery) {
                     return this.sendZclFrameToEndpointInternal(
                         ieeeAddr, networkAddress, endpoint, sourceEndpoint, zclFrame, timeout, disableResponse,
@@ -508,10 +501,10 @@ class EZSPAdapter extends Adapter {
         }
     }
 
-    public async sendZclFrameToGroup(groupID: number, zclFrame: ZclFrame): Promise<void> {
+    public async sendZclFrameToGroup(groupID: number, zclFrame: Zcl.Frame): Promise<void> {
         return this.queue.execute<void>(async () => {
             this.checkInterpanLock();
-            const frame = this.driver.makeApsFrame(zclFrame.Cluster.ID, false);
+            const frame = this.driver.makeApsFrame(zclFrame.cluster.ID, false);
             frame.profileId = 0x0104;
             frame.sourceEndpoint =  0x01;
             frame.destinationEndpoint = 0x01;
@@ -527,14 +520,14 @@ class EZSPAdapter extends Adapter {
         });
     }
 
-    public async sendZclFrameToAll(endpoint: number, zclFrame: ZclFrame, sourceEndpoint: number): Promise<void> {
+    public async sendZclFrameToAll(endpoint: number, zclFrame: Zcl.Frame, sourceEndpoint: number, destination: BroadcastAddress): Promise<void> {
         return this.queue.execute<void>(async () => {
             this.checkInterpanLock();
-            const frame = this.driver.makeApsFrame(zclFrame.Cluster.ID, false);
+            const frame = this.driver.makeApsFrame(zclFrame.cluster.ID, false);
             frame.profileId = sourceEndpoint === 242 && endpoint === 242 ? 0xA1E0 : 0x0104;
             frame.sourceEndpoint =  sourceEndpoint;
             frame.destinationEndpoint = endpoint;
-            frame.groupId = 0xFFFD;
+            frame.groupId = destination;
             
             await this.driver.mrequest(frame, zclFrame.toBuffer());
 
@@ -655,9 +648,9 @@ class EZSPAdapter extends Adapter {
         }
     }
 
-    public async sendZclFrameInterPANToIeeeAddr(zclFrame: ZclFrame, ieeeAddr: string): Promise<void> {
+    public async sendZclFrameInterPANToIeeeAddr(zclFrame: Zcl.Frame, ieeeAddr: string): Promise<void> {
         return this.queue.execute<void>(async () => {
-            debug(`sendZclFrameInterPANToIeeeAddr to ${ieeeAddr}`);
+            logger.debug(`sendZclFrameInterPANToIeeeAddr to ${ieeeAddr}`, NS);
             try {
                 const frame = this.driver.makeEmberIeeeRawFrame();
                 frame.ieeeFrameControl = 0xcc21;
@@ -667,7 +660,7 @@ class EZSPAdapter extends Adapter {
                 frame.sourceAddress = this.driver.ieee;
                 frame.nwkFrameControl = 0x000b;
                 frame.appFrameControl = 0x03;
-                frame.clusterId = zclFrame.Cluster.ID;
+                frame.clusterId = zclFrame.cluster.ID;
                 frame.profileId = 0xc05e;
 
                 await this.driver.ieeerawrequest(frame, zclFrame.toBuffer());
@@ -677,16 +670,16 @@ class EZSPAdapter extends Adapter {
         });
     }
 
-    public async sendZclFrameInterPANBroadcast(zclFrame: ZclFrame, timeout: number): Promise<Events.ZclDataPayload> {
-        return this.queue.execute<Events.ZclDataPayload>(async () => {
-            debug(`sendZclFrameInterPANBroadcast`);
-            const command = zclFrame.getCommand();
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number): Promise<Events.ZclPayload> {
+        return this.queue.execute<Events.ZclPayload>(async () => {
+            logger.debug(`sendZclFrameInterPANBroadcast`, NS);
+            const command = zclFrame.command;
             if (!command.hasOwnProperty('response')) {
                 throw new Error(`Command '${command.name}' has no response, cannot wait for response`);
             }
 
             const response = this.waitForInternal(
-                null, 0xFE, null, zclFrame.Cluster.ID, command.response, timeout
+                null, 0xFE, null, zclFrame.cluster.ID, command.response, timeout
             );
 
             try {
@@ -698,7 +691,7 @@ class EZSPAdapter extends Adapter {
                 frame.ieeeAddress = this.driver.ieee;
                 frame.nwkFrameControl = 0x000b;
                 frame.appFrameControl = 0x0b;
-                frame.clusterId = zclFrame.Cluster.ID;
+                frame.clusterId = zclFrame.cluster.ID;
                 frame.profileId = 0xc05e;
 
                 await this.driver.rawrequest(frame, zclFrame.toBuffer());
@@ -711,8 +704,17 @@ class EZSPAdapter extends Adapter {
         });
     }
 
+    public async supportsChangeChannel(): Promise<boolean> {
+        return false;
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    public async changeChannel(newChannel: number): Promise<void> {
+        return Promise.reject(new Error("Not supported"));
+    }
+
     public async setTransmitPower(value: number): Promise<void> {
-        debug(`setTransmitPower to ${value}`);
+        logger.debug(`setTransmitPower to ${value}`, NS);
         return this.queue.execute<void>(async () => {
             await this.driver.setRadioPower(value);
         });
@@ -727,7 +729,7 @@ class EZSPAdapter extends Adapter {
 
     private waitForInternal(
         networkAddress: number, endpoint: number, transactionSequenceNumber: number, clusterID: number, commandIdentifier: number, timeout: number,
-    ): { start: () => { promise: Promise<Events.ZclDataPayload> }; cancel: () => void } {
+    ): { start: () => { promise: Promise<Events.ZclPayload> }; cancel: () => void } {
         const payload = {
             address: networkAddress, endpoint, clusterID, commandIdentifier,
             transactionSequenceNumber,
@@ -739,9 +741,9 @@ class EZSPAdapter extends Adapter {
     }
 
     public waitFor(
-        networkAddress: number, endpoint: number, frameType: FrameType, direction: Direction,
+        networkAddress: number, endpoint: number, frameType: Zcl.FrameType, direction: Zcl.Direction,
         transactionSequenceNumber: number, clusterID: number, commandIdentifier: number, timeout: number,
-    ): { promise: Promise<Events.ZclDataPayload>; cancel: () => void } {
+    ): { promise: Promise<Events.ZclPayload>; cancel: () => void } {
         const waiter = this.waitForInternal(
             networkAddress, endpoint, transactionSequenceNumber, clusterID,
             commandIdentifier, timeout,
@@ -756,13 +758,13 @@ class EZSPAdapter extends Adapter {
             ` - ${matcher.commandIdentifier} after ${timeout}ms`;
     }
 
-    private waitressValidator(payload: Events.ZclDataPayload, matcher: WaitressMatcher): boolean {
-        const transactionSequenceNumber = payload.frame.Header.transactionSequenceNumber;
-        return (!matcher.address || payload.address === matcher.address) &&
+    private waitressValidator(payload: Events.ZclPayload, matcher: WaitressMatcher): boolean {
+        return payload.header &&
+            (!matcher.address || payload.address === matcher.address) &&
             payload.endpoint === matcher.endpoint &&
-            (!matcher.transactionSequenceNumber || transactionSequenceNumber === matcher.transactionSequenceNumber) &&
-            payload.frame.Cluster.ID === matcher.clusterID &&
-            matcher.commandIdentifier === payload.frame.Header.commandIdentifier;
+            (!matcher.transactionSequenceNumber || payload.header.transactionSequenceNumber === matcher.transactionSequenceNumber) &&
+            payload.clusterID === matcher.clusterID &&
+            matcher.commandIdentifier === payload.header.commandIdentifier;
     }
 }
 

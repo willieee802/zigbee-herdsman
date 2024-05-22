@@ -1,16 +1,13 @@
 import {DatabaseEntry, KeyValue} from '../tstype';
 import Entity from './entity';
 import ZclTransactionSequenceNumber from '../helpers/zclTransactionSequenceNumber';
-import * as Zcl from '../../zcl';
+import * as Zcl from '../../zspec/zcl';
 import Endpoint from './endpoint';
 import Device from './device';
 import assert from 'assert';
-import Debug from "debug";
+import {logger} from '../../utils/logger';
 
-const debug = {
-    info: Debug('zigbee-herdsman:controller:group'),
-    error: Debug('zigbee-herdsman:controller:group'),
-};
+const NS = 'zh:controller:group';
 
 interface Options {
     manufacturerCode?: number;
@@ -101,6 +98,9 @@ class Group extends Entity {
 
     public static create(groupID: number, databaseID: number): Group {
         assert(typeof groupID === 'number', 'GroupID must be a number');
+        // Don't allow groupID 0, from the spec:
+        // "Scene identifier 0x00, along with group identifier 0x0000, is reserved for the global scene used by the OnOff cluster"
+        assert(groupID >= 1, 'GroupID must be at least 1');
         Group.loadFromDatabaseIfNecessary();
         if (Group.groups.get(databaseID)[groupID]) {
             throw new Error(`Group with groupID '${groupID}' already exists`);
@@ -160,7 +160,7 @@ class Group extends Entity {
         clusterKey: number | string, attributes: KeyValue, options?: Options
     ): Promise<void> {
         options = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
-        const cluster = Zcl.Utils.getCluster(clusterKey);
+        const cluster = Zcl.Utils.getCluster(clusterKey, null, {});
         const payload: {attrId: number; dataType: number; attrData: number| string | boolean}[] = [];
         for (const [nameOrID, value] of Object.entries(attributes)) {
             if (cluster.hasAttribute(nameOrID)) {
@@ -174,18 +174,18 @@ class Group extends Entity {
         }
 
         const log = `Write ${this.groupID} ${cluster.name}(${JSON.stringify(attributes)}, ${JSON.stringify(options)})`;
-        debug.info(log);
+        logger.debug(log, NS);
 
         try {
-            const frame = Zcl.ZclFrame.create(
+            const frame = Zcl.Frame.create(
                 Zcl.FrameType.GLOBAL, options.direction, true,
                 options.manufacturerCode, options.transactionSequenceNumber ?? ZclTransactionSequenceNumber.next(),
-                'write', cluster.ID, payload, options.reservedBits
+                'write', cluster.ID, payload, {}, options.reservedBits
             );
             await Entity.getAdapterByID(this.databaseID).sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
         } catch (error) {
             error.message = `${log} failed (${error.message})`;
-            debug.error(error.message);
+            logger.debug(error, NS);
             throw error;
         }
     }
@@ -194,26 +194,26 @@ class Group extends Entity {
         clusterKey: number | string, attributes: (string | number)[], options?: Options
     ): Promise<void> {
         options = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
-        const cluster = Zcl.Utils.getCluster(clusterKey);
+        const cluster = Zcl.Utils.getCluster(clusterKey, null, {});
         const payload: {attrId: number}[] = [];
         for (const attribute of attributes) {
             payload.push({attrId: typeof attribute === 'number' ? attribute : cluster.getAttribute(attribute).ID});
         }
 
-        const frame = Zcl.ZclFrame.create(
+        const frame = Zcl.Frame.create(
             Zcl.FrameType.GLOBAL, options.direction, true,
             options.manufacturerCode, options.transactionSequenceNumber ?? ZclTransactionSequenceNumber.next(), 'read',
-            cluster.ID, payload, options.reservedBits
+            cluster.ID, payload, {}, options.reservedBits
         );
 
         const log = `Read ${this.groupID} ${cluster.name}(${JSON.stringify(attributes)}, ${JSON.stringify(options)})`;
-        debug.info(log);
+        logger.debug(log, NS);
 
         try {
             await Entity.getAdapterByID(this.databaseID).sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
         } catch (error) {
             error.message = `${log} failed (${error.message})`;
-            debug.error(error.message);
+            logger.debug(error, NS);
             throw error;
         }
     }
@@ -222,22 +222,22 @@ class Group extends Entity {
         clusterKey: number | string, commandKey: number | string, payload: KeyValue, options?: Options
     ): Promise<void> {
         options = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER);
-        const cluster = Zcl.Utils.getCluster(clusterKey);
+        const cluster = Zcl.Utils.getCluster(clusterKey, null, {});
         const command = cluster.getCommand(commandKey);
 
         const log = `Command ${this.groupID} ${cluster.name}.${command.name}(${JSON.stringify(payload)})`;
-        debug.info(log);
+        logger.debug(log, NS);
 
         try {
-            const frame = Zcl.ZclFrame.create(
+            const frame = Zcl.Frame.create(
                 Zcl.FrameType.SPECIFIC, options.direction, true, options.manufacturerCode,
                 options.transactionSequenceNumber || ZclTransactionSequenceNumber.next(),
-                command.ID, cluster.ID, payload, options.reservedBits
+                command.ID, cluster.ID, payload, {}, options.reservedBits
             );
             await Entity.getAdapterByID(this.databaseID).sendZclFrameToGroup(this.groupID, frame, options.srcEndpoint);
         } catch (error) {
             error.message = `${log} failed (${error.message})`;
-            debug.error(error.message);
+            logger.debug(error, NS);
             throw error;
         }
     }

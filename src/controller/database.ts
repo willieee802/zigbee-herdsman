@@ -1,16 +1,15 @@
 import fs from 'fs';
-import Debug from "debug";
 import {DatabaseEntry, EntityType} from './tstype';
 import {Entity} from './model';
+import {logger} from '../utils/logger';
 
-const debug = {
-    log: Debug('zigbee-herdsman:controller:database:log'),
-};
+const NS = 'zh:controller:database';
 
 class Database {
     private _id: number;
     private entries: {[id: number]: DatabaseEntry};
     private path: string;
+    private maxId: number;
 
     public get id(): number {
         return this._id;
@@ -19,6 +18,7 @@ class Database {
     private constructor(entries: {[id: number]: DatabaseEntry}, path: string) {
         this._id = this.generateDatabaseID();
         this.entries = entries;
+        this.maxId = Math.max(...Object.keys(entries).map((t) => Number(t)), 0);
         this.path = path;
     }
 
@@ -85,15 +85,12 @@ class Database {
     }
 
     public newID(): number {
-        for (let i = 1; i < 100000; i++) {
-            if (!this.entries[i]) {
-                return i;
-            }
-        }
+        this.maxId += 1;
+        return this.maxId;
     }
 
     public write(): void {
-        debug.log(`Writing database to '${this.path}'`);
+        logger.debug(`Writing database to '${this.path}'`, NS);
         const lines = [];
         for (const DatabaseEntry of Object.values(this.entries)) {
             const json = JSON.stringify(DatabaseEntry);

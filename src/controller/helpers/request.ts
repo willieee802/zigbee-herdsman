@@ -1,5 +1,5 @@
 import {SendPolicy} from '../tstype';
-import * as Zcl from '../../zcl';
+import * as Zcl from '../../zspec/zcl';
 
 /* eslint-disable-next-line @typescript-eslint/no-explicit-any*/
 class Request<Type = any> {
@@ -30,21 +30,21 @@ class Request<Type = any> {
         0x16: 'immediate',      // Discover Attributes Extended Response
     };
 
-    private func: (frame: Zcl.ZclFrame) => Promise<Type>;
-    frame: Zcl.ZclFrame;
+    private func: (frame: Zcl.Frame) => Promise<Type>;
+    frame: Zcl.Frame;
     expires: number;
     sendPolicy: SendPolicy;
     private resolveQueue: Array<(value: Type) => void>;
     private rejectQueue: Array <(error: Error) => void>;
     private lastError: Error;
-    constructor (func: (frame: Zcl.ZclFrame) => Promise<Type>, frame: Zcl.ZclFrame, timeout: number,
+    constructor (func: (frame: Zcl.Frame) => Promise<Type>, frame: Zcl.Frame, timeout: number,
         sendPolicy?: SendPolicy, lastError?: Error,
         resolve?:(value: Type) => void, reject?: (error: Error) => void) {
         this.func = func;
         this.frame = frame;
         this.expires =  timeout + Date.now();
-        this.sendPolicy = sendPolicy ?? (typeof frame.getCommand !== 'function' ?
-            undefined : Request.defaultSendPolicy[frame.getCommand().ID]);
+        this.sendPolicy = sendPolicy ?? (!frame.command ?
+            undefined : Request.defaultSendPolicy[frame.command.ID]);
         this.resolveQueue = resolve === undefined ?
             new Array<(value: Type) => void>() : new Array<(value: Type) => void>(resolve);
         this.rejectQueue = reject === undefined ?

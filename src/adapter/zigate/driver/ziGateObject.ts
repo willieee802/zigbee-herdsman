@@ -5,20 +5,19 @@ import BuffaloZiGate, {BuffaloZiGateOptions} from './buffaloZiGate';
 import {ZiGateCommandCode, ZiGateMessageCode, ZiGateObjectPayload} from "./constants";
 import {ZiGateMessage, ZiGateMessageParameter} from "./messageType";
 import {ZiGateCommand, ZiGateCommandParameter, ZiGateCommandType} from "./commandType";
-import {Debug} from '../debug';
+import {logger} from '../../../utils/logger';
+import ParameterType from './parameterType';
 
 type ZiGateCode = ZiGateCommandCode | ZiGateMessageCode;
 type ZiGateParameter = ZiGateCommandParameter | ZiGateMessageParameter;
 
 
-const debug = Debug('driver:ziGateObject');
+const NS = 'zh:zigate:object';
 
-const BufferAndListTypes = [
-    'BUFFER', 'BUFFER8', 'BUFFER16',
-    'BUFFER18', 'BUFFER32', 'BUFFER42',
-    'BUFFER100', 'LIST_UINT16', 'LIST_ROUTING_TABLE',
-    'LIST_BIND_TABLE', 'LIST_NEIGHBOR_LQI', 'LIST_NETWORK',
-    'LIST_ASSOC_DEV', 'LIST_UINT8',
+const BufferAndListTypes: ParameterType[] = [
+    ParameterType.BUFFER, ParameterType.BUFFER8, ParameterType.BUFFER16,
+    ParameterType.BUFFER18, ParameterType.BUFFER32, ParameterType.BUFFER42,
+    ParameterType.BUFFER100, ParameterType.LIST_UINT16, ParameterType.LIST_UINT8,
 ];
 
 class ZiGateObject {
@@ -111,17 +110,14 @@ class ZiGateObject {
             try {
                 result[parameter.name] = buffalo.read(parameter.parameterType, options);
             } catch (e) {
-                debug.error(e.stack);
+                logger.error(e.stack, NS);
             }
         }
 
         if (buffalo.isMore()) {
             let bufferString = buffalo.getBuffer().toString('hex');
-            debug.error(
-                "Last bytes of data were not parsed \x1b[32m%s\x1b[31m%s\x1b[0m ",
-                bufferString.slice(0, (buffalo.getPosition() * 2)).replace(/../g, "$& "),
-                bufferString.slice(buffalo.getPosition() * 2).replace(/../g, "$& ")
-            )
+            logger.debug(`Last bytes of data were not parsed \x1b[32m${bufferString.slice(0, (buffalo.getPosition() * 2)).replace(/../g, "$& ")}`
+                + `\x1b[31m${bufferString.slice(buffalo.getPosition() * 2).replace(/../g, "$& ")}\x1b[0m `, NS);
         }
 
         return result;

@@ -1,4 +1,5 @@
-import Controller from './controller/controller';
-import * as Zcl from './zcl';
-
-export {Zcl, Controller};
+export {default as Controller} from './controller/controller';
+export * as Zcl from './zspec/zcl';
+export * as Zdo from './zspec/zdo';
+export * as ZSpec from './zspec';
+export {setLogger} from './utils/logger';
