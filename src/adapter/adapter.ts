@@ -6,6 +6,7 @@ import * as Models from "../models";
 import Bonjour, {Service} from 'bonjour-service';
 import {logger} from '../utils/logger';
 import {BroadcastAddress} from '../zspec/enums';
+import {KonnextConfig} from '../controller/model/konnextConfig';
 
 const NS = 'zh:adapter';
 
@@ -34,6 +35,7 @@ abstract class Adapter extends events.EventEmitter {
         serialPortOptions: TsType.SerialPortOptions,
         backupPath: string,
         adapterOptions: TsType.AdapterOptions,
+        konnextConfig: KonnextConfig,
     ): Promise<Adapter> {
         const {ZStackAdapter} = await import('./z-stack/adapter');
         const {DeconzAdapter} = await import('./deconz/adapter');
@@ -111,7 +113,7 @@ abstract class Adapter extends events.EventEmitter {
                                     && serialPortOptions.adapter !== 'auto') {
                                 adapter = adapterLookup[serialPortOptions.adapter];
                                 resolve(
-                                    new adapter(networkOptions, serialPortOptions, backupPath, adapterOptions)
+                                    new adapter(networkOptions, serialPortOptions, backupPath, adapterOptions, konnextConfig)
                                 );
                             } else {
                                 reject(new Error(`Adapter ${serialPortOptions.adapter} is not supported.`));
@@ -147,7 +149,7 @@ abstract class Adapter extends events.EventEmitter {
             }
         }
 
-        return new adapter(networkOptions, serialPortOptions, backupPath, adapterOptions);
+        return new adapter(networkOptions, serialPortOptions, backupPath, adapterOptions, konnextConfig);
     }
 
     public abstract start(): Promise<TsType.StartResult>;
