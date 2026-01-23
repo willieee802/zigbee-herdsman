@@ -1,6 +1,6 @@
 # NOTICE
 
-This is a custom forked version of zigbee-herdsman by Koen Kanters, with multiple database instance maintained.
+1:qwThis is a custom forked version of zigbee-herdsman by Koen Kanters, with multiple database instance maintained.
 
 It is not yet covered with tests and not necessarily reliable.
 
