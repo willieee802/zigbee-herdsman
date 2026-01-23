@@ -17,6 +17,7 @@ import * as Models from "../../../models";
 import assert from 'assert';
 import {logger} from '../../../utils/logger';
 import {BroadcastAddress} from '../../../zspec/enums';
+import {KonnextConfig} from '../../../controller/model/konnextConfig';
 
 const NS = "zh:zstack";
 const Subsystem = UnpiConstants.Subsystem;
@@ -67,11 +68,13 @@ class ZStackAdapter extends Adapter {
     private interpanLock: boolean;
     private interpanEndpointRegistered: boolean;
     private waitress: Waitress<Events.ZclPayload, WaitressMatcher>;
+    private konnextConfig: KonnextConfig;
 
-    public constructor(networkOptions: NetworkOptions, serialPortOptions: SerialPortOptions, backupPath: string, adapterOptions: AdapterOptions) {
+    public constructor(networkOptions: NetworkOptions, serialPortOptions: SerialPortOptions, backupPath: string, adapterOptions: AdapterOptions,konnextConfig: KonnextConfig) {
         super(networkOptions, serialPortOptions, backupPath, adapterOptions);
-        this.znp = new Znp(this.serialPortOptions.path, this.serialPortOptions.baudRate, this.serialPortOptions.rtscts);
+        this.znp = new Znp(this.serialPortOptions.path, this.serialPortOptions.baudRate, this.serialPortOptions.rtscts,konnextConfig);
 
+        this.konnextConfig = konnextConfig;
         this.transactionID = 0;
         this.deviceAnnounceRouteDiscoveryDebouncers = new Map();
         this.interpanLock = false;

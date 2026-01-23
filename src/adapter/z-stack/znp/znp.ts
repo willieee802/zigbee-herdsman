@@ -20,6 +20,7 @@ import net from 'net';
 import events from 'events';
 import Equals from 'fast-deep-equal/es6';
 import {logger} from '../../../utils/logger';
+import {KonnextConfig} from '../../../controller/model/konnextConfig';
 
 const {COMMON: {ZnpCommandStatus}, Utils: {statusDescription}} = Constants;
 
@@ -58,8 +59,9 @@ class Znp extends events.EventEmitter {
     private initialized: boolean;
     private queue: Queue;
     private waitress: Waitress<ZpiObject, WaitressMatcher>;
+    private konnextConfig: KonnextConfig | null;
 
-    public constructor(path: string, baudRate: number, rtscts: boolean) {
+    public constructor(path: string, baudRate: number, rtscts: boolean, konnextConfig: KonnextConfig) {
         super();
 
         this.path = path;
@@ -71,6 +73,8 @@ class Znp extends events.EventEmitter {
 
         this.queue = new Queue();
         this.waitress = new Waitress<ZpiObject, WaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
+
+        this.konnextConfig = konnextConfig;
     }
 
     private log(type: Type, message: string): void {
@@ -130,7 +134,7 @@ class Znp extends events.EventEmitter {
         // @ts-ignore
         this.unpiWriter.pipe(this.serialPort);
 
-        this.unpiParser = new UnpiParser();
+        this.unpiParser = new UnpiParser(this.konnextConfig);
         this.serialPort.pipe(this.unpiParser);
         this.unpiParser.on('parsed', this.onUnpiParsed.bind(this));
 
@@ -166,7 +170,7 @@ class Znp extends events.EventEmitter {
         this.unpiWriter = new UnpiWriter();
         this.unpiWriter.pipe(this.socketPort);
 
-        this.unpiParser = new UnpiParser();
+        this.unpiParser = new UnpiParser(this.konnextConfig);
         this.socketPort.pipe(this.unpiParser);
         this.unpiParser.on('parsed', this.onUnpiParsed.bind(this));
 
@@ -205,7 +209,7 @@ class Znp extends events.EventEmitter {
             // and give ZNP 1 second to start.
             try {
                 logger.info('Writing CC2530/CC2531 skip bootloader payload', NS);
-                this.unpiWriter.writeBuffer(Buffer.from([0xef]));
+                this.unpiWriter.writeBuffer(Buffer.from([0xef]), this.konnextConfig);
                 await Wait(1000);
                 await this.request(Subsystem.SYS, 'ping', {capabilities: 1}, null, 250);
             } catch (error) {
@@ -301,7 +305,7 @@ class Znp extends events.EventEmitter {
                 const waiter = this.waitress.waitFor(
                     {type: Type.SRSP, subsystem: object.subsystem, command: object.command}, timeout || t
                 );
-                this.unpiWriter.writeFrame(frame);
+                this.unpiWriter.writeFrame(frame, this.konnextConfig);
                 const result = await waiter.start().promise;
                 if (result && result.payload.hasOwnProperty('status') &&
                     !expectedStatuses.includes(result.payload.status)) {
@@ -323,12 +327,12 @@ class Znp extends events.EventEmitter {
                     {type: Type.AREQ, subsystem: Subsystem.SYS, command: 'resetInd'}, timeout || timeouts.reset
                 );
                 this.queue.clear();
-                this.unpiWriter.writeFrame(frame);
+                this.unpiWriter.writeFrame(frame, this.konnextConfig);
                 return waiter.start().promise;
             } else {
                 /* istanbul ignore else */
                 if (object.type === Type.AREQ) {
-                    this.unpiWriter.writeFrame(frame);
+                    this.unpiWriter.writeFrame(frame, this.konnextConfig);
                     return undefined;
                 } else {
                     throw new Error(`Unknown type '${object.type}'`);

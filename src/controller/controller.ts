@@ -18,6 +18,7 @@ import assert from 'assert';
 import mixin from 'mixin-deep';
 import Group from './model/group';
 import {logger} from '../utils/logger';
+import {KonnextConfig} from './model/konnextConfig';
 
 const NS = 'zh:controller';
 
@@ -28,6 +29,7 @@ interface Options {
     databaseBackupPath: string;
     backupPath: string;
     adapter: AdapterTsType.AdapterOptions;
+    konnextConfig: KonnextConfig;
     /**
      * This lambda can be used by an application to explictly reject or accept an incoming device.
      * When false is returned zigbee-herdsman will not start the interview process and immidiately
@@ -58,6 +60,9 @@ const DefaultOptions: Options = {
     backupPath: null,
     adapter: {disableLED: false},
     acceptJoiningDeviceHandler: null,
+    konnextConfig: {
+        isEncrypted: 0,
+    },
 };
 
 /**
@@ -122,7 +127,7 @@ class Controller extends events.EventEmitter {
         Entity.injectDatabase(this.database);
 
         // Adapter (create and inject)
-        this.adapter = await Adapter.create(this.options.network, this.options.serialPort, this.options.backupPath, this.options.adapter);
+        this.adapter = await Adapter.create(this.options.network, this.options.serialPort, this.options.backupPath, this.options.adapter, this.options.konnextConfig);
         logger.debug(`Starting with options '${JSON.stringify(this.options)}'`, NS);
         const startResult = await this.adapter.start();
 
