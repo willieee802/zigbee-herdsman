@@ -24,6 +24,7 @@ import {InterviewState} from "./model/device";
 import Group from "./model/group";
 import Touchlink from "./touchlink";
 import type {DeviceType, GreenPowerDeviceJoinedPayload, RawPayload} from "./tstype";
+import {KonnextConfig} from "./model/konnextConfig";
 
 const NS = "zh:controller";
 
@@ -34,6 +35,7 @@ interface Options {
     databaseBackupPath: string;
     backupPath: string;
     adapter: AdapterTsType.AdapterOptions;
+    konnextConfig: KonnextConfig;
     /**
      * This lambda can be used by an application to explictly reject or accept an incoming device.
      * When false is returned zigbee-herdsman will not start the interview process and immidiately
@@ -83,7 +85,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         super();
         this.stopping = false;
         this.adapterDisconnected = true; // set false after adapter.start() is successfully called
-        const {network: networkOpts, serialPort: serialPortOpts, adapter: adapterOpts, ...restOpts} = options;
+        const {network: networkOpts, serialPort: serialPortOpts, adapter: adapterOpts, konnextConfig: konnextConfigOpts, ...restOpts} = options;
         this.options = {
             network: {
                 networkKeyDistribute: false,
@@ -94,6 +96,11 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
             serialPort: {...serialPortOpts},
             adapter: {
                 ...adapterOpts,
+            },
+            konnextConfig: {
+                // @ts-ignore-next-line we need to set a default value for isEncrypted
+                isEncrypted: 0,
+                ...konnextConfigOpts,
             },
             ...restOpts,
         };
@@ -136,7 +143,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         Entity.injectDatabase(this.database);
 
         // Adapter (create and inject)
-        this.adapter = await Adapter.create(this.options.network, this.options.serialPort, this.options.backupPath, this.options.adapter);
+        this.adapter = await Adapter.create(this.options.network, this.options.serialPort, this.options.backupPath, this.options.adapter, this.options.konnextConfig);
 
         abortSignal?.throwIfAborted();
 
@@ -165,12 +172,12 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
             }
         }
 
-        Entity.injectAdapter(this.adapter);
+        Entity.injectAdapter(this.database.id, this.adapter);
 
         // log injection
         logger.debug(`Injected database: ${this.database !== undefined}, adapter: ${this.adapter !== undefined}`, NS);
 
-        this.#greenPower = new GreenPower(this.adapter);
+        this.#greenPower = new GreenPower(this.adapter, this.database.id);
         this.#greenPower.on("deviceJoined", this.onDeviceJoinedGreenPower.bind(this));
         this.#greenPower.on("deviceLeave", this.onDeviceLeaveGreenPower.bind(this));
 
@@ -202,7 +209,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         // Add coordinator to the database if it is not there yet.
         const coordinatorIEEE = await this.adapter.getCoordinatorIEEE();
 
-        if (Device.byType("Coordinator").length === 0) {
+        if (Device.byType(this.database.id, "Coordinator").length === 0) {
             logger.debug("No coordinator in database, querying...", NS);
             const coordinator = Device.create(
                 "Coordinator",
@@ -214,6 +221,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 undefined,
                 InterviewState.Successful,
                 undefined,
+                this.database.id,
             );
 
             await coordinator.updateActiveEndpoints();
@@ -230,7 +238,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         }
 
         // Update coordinator ieeeAddr if changed, can happen due to e.g. reflashing
-        const databaseCoordinator = Device.byType("Coordinator")[0];
+        const databaseCoordinator = Device.byType(this.database.id, "Coordinator")[0];
         if (databaseCoordinator.ieeeAddr !== coordinatorIEEE) {
             logger.info(`Coordinator address changed, updating to '${coordinatorIEEE}'`, NS);
             databaseCoordinator.changeIeeeAddress(coordinatorIEEE);
@@ -460,14 +468,16 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
 
         Device.resetCache();
         Group.resetCache();
+        Entity.removeAdapter(this.database.id);
+        Entity.removeDatabase(this.database.id);
     }
 
     private databaseSave(): void {
-        for (const device of Device.allIterator()) {
+        for (const device of Device.allIterator(this.database.id)) {
             device.save(false);
         }
 
-        for (const group of Group.allIterator()) {
+        for (const group of Group.allIterator(this.database.id)) {
             group.save(false);
         }
 
@@ -521,39 +531,46 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
     }
 
     /**
+     * Get the database ID for this controller's database.
+     */
+    public getDatabaseId(): number {
+        return this.database.id;
+    }
+
+    /**
      * Get all devices
      * @deprecated use getDevicesIterator()
      */
     public getDevices(): Device[] {
-        return Device.all();
+        return Device.allByDatabaseID(this.database.id);
     }
 
     /**
      * Get iterator for all devices
      */
     public getDevicesIterator(predicate?: (value: Device) => boolean): Generator<Device> {
-        return Device.allIterator(predicate);
+        return Device.allIterator(this.database.id, predicate);
     }
 
     /**
      * Get all devices with a specific type
      */
     public getDevicesByType(type: DeviceType): Device[] {
-        return Device.byType(type);
+        return Device.byType(this.database.id, type);
     }
 
     /**
      * Get device by ieeeAddr
      */
     public getDeviceByIeeeAddr(ieeeAddr: string): Device | undefined {
-        return Device.byIeeeAddr(ieeeAddr);
+        return Device.byIeeeAddr(this.database.id, ieeeAddr);
     }
 
     /**
      * Get device by networkAddress
      */
     public getDeviceByNetworkAddress(networkAddress: number): Device | undefined {
-        return Device.byNetworkAddress(networkAddress);
+        return Device.byNetworkAddress(this.database.id, networkAddress);
     }
 
     /**
@@ -562,7 +579,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
     public getDeviceIeeeAddresses(): string[] {
         const deviceIeeeAddresses = [];
 
-        for (const device of Device.allIterator()) {
+        for (const device of Device.allIterator(this.database.id)) {
             deviceIeeeAddresses.push(device.ieeeAddr);
         }
 
@@ -573,7 +590,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
      * Get group by ID
      */
     public getGroupByID(groupID: number): Group | undefined {
-        return Group.byGroupID(groupID);
+        return Group.byGroupID(groupID, this.database.id);
     }
 
     /**
@@ -581,21 +598,21 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
      * @deprecated use getGroupsIterator()
      */
     public getGroups(): Group[] {
-        return Group.all();
+        return Group.allByDatabaseID(this.database.id);
     }
 
     /**
      * Get iterator for all groups
      */
     public getGroupsIterator(predicate?: (value: Group) => boolean): Generator<Group> {
-        return Group.allIterator(predicate);
+        return Group.allIterator(this.database.id, predicate);
     }
 
     /**
      * Create a Group
      */
     public createGroup(groupID: number): Group {
-        return Group.create(groupID);
+        return Group.create(groupID, this.database.id);
     }
 
     /**
@@ -647,7 +664,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
 
             if (Zdo.Buffalo.checkStatus<Zdo.ClusterId.IEEE_ADDRESS_RESPONSE>(response)) {
                 const payload = response[1];
-                const device = Device.byIeeeAddr(payload.eui64);
+                const device = Device.byIeeeAddr(this.database.id, payload.eui64);
 
                 if (device) {
                     this.checkDeviceNetworkAddress(device, payload.eui64, payload.nwkAddress);
@@ -679,7 +696,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
 
     private onNetworkAddress(payload: ZdoTypes.NetworkAddressResponse): void {
         logger.debug(`Network address from '${payload.eui64}:${payload.nwkAddress}'`, NS);
-        const device = Device.byIeeeAddr(payload.eui64);
+        const device = Device.byIeeeAddr(this.database.id, payload.eui64);
 
         if (!device) {
             logger.debug(`Network address is from unknown device '${payload.eui64}:${payload.nwkAddress}'`, NS);
@@ -693,7 +710,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
 
     private onIEEEAddress(payload: ZdoTypes.IEEEAddressResponse): void {
         logger.debug(`IEEE address from '${payload.eui64}:${payload.nwkAddress}'`, NS);
-        const device = Device.byIeeeAddr(payload.eui64);
+        const device = Device.byIeeeAddr(this.database.id, payload.eui64);
 
         if (!device) {
             logger.debug(`IEEE address is from unknown device '${payload.eui64}:${payload.nwkAddress}'`, NS);
@@ -707,7 +724,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
 
     private onDeviceAnnounce(payload: ZdoTypes.EndDeviceAnnounce): void {
         logger.debug(`Device announce from '${payload.eui64}:${payload.nwkAddress}'`, NS);
-        const device = Device.byIeeeAddr(payload.eui64);
+        const device = Device.byIeeeAddr(this.database.id, payload.eui64);
 
         if (!device) {
             logger.debug(`Device announce is from unknown device '${payload.eui64}:${payload.nwkAddress}'`, NS);
@@ -726,7 +743,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
 
         // XXX: seems type is not properly detected?
         // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-        const device = payload.ieeeAddr ? Device.byIeeeAddr(payload.ieeeAddr) : Device.byNetworkAddress(payload.networkAddress!);
+        const device = payload.ieeeAddr ? Device.byIeeeAddr(this.database.id, payload.ieeeAddr) : Device.byNetworkAddress(this.database.id, payload.networkAddress!);
 
         if (!device) {
             logger.debug(`Device leave is from unknown or already deleted device '${payload.ieeeAddr ?? payload.networkAddress}'`, NS);
@@ -760,7 +777,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         const ieeeAddr = GreenPower.sourceIdToIeeeAddress(payload.sourceID);
         // Green power devices dont' have a modelID, create a modelID based on the deviceID (=type)
         const modelID = `GreenPower_${payload.deviceID}`;
-        let device = Device.byIeeeAddr(ieeeAddr, true);
+        let device = Device.byIeeeAddr(this.database.id, ieeeAddr, true);
 
         if (!device) {
             logger.debug(`New green power device '${ieeeAddr}' joined`, NS);
@@ -775,6 +792,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 modelID,
                 InterviewState.Successful,
                 payload.securityKey ? Array.from(payload.securityKey) : /* v8 ignore next */ undefined,
+                this.database.id,
             );
 
             device.save();
@@ -796,7 +814,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
 
         // Green power devices don't have an ieeeAddr, the sourceID is unique and static so use this.
         const ieeeAddr = GreenPower.sourceIdToIeeeAddress(sourceID);
-        const device = Device.byIeeeAddr(ieeeAddr);
+        const device = Device.byIeeeAddr(this.database.id, ieeeAddr);
 
         if (!device) {
             logger.debug(`Green power device leave is from unknown or already deleted device '${ieeeAddr}'`, NS);
@@ -849,7 +867,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
             logger.debug(`Device '${payload.ieeeAddr}' accepted by handler`, NS);
         }
 
-        let device = Device.byIeeeAddr(payload.ieeeAddr, true);
+        let device = Device.byIeeeAddr(this.database.id, payload.ieeeAddr, true);
         if (!device) {
             logger.debug(`New device '${payload.ieeeAddr}' joined`, NS);
             logger.debug(`Creating device '${payload.ieeeAddr}'`, NS);
@@ -863,6 +881,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 undefined,
                 InterviewState.Pending,
                 undefined,
+                this.database.id,
             );
             this.selfAndDeviceEmit(device, "deviceJoined", {device});
         } else if (device.isDeleted) {
@@ -952,7 +971,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 //   - greenPower.commandsResponse.commissioningMode
                 //   - Foundation.defaultRsp for greenPower.commandsResponse.pairing with status INVALID_FIELD or INSUFFICIENT_SPACE
                 //   - ...
-                device = Device.find(payload.address);
+                device = Device.find(this.database.id, payload.address);
             } else {
                 if (frame.payload.srcID === undefined) {
                     logger.debug("Data is from unsupported green power device with IEEE addressing, skipping...", NS);
@@ -960,11 +979,11 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 }
 
                 const ieeeAddr = GreenPower.sourceIdToIeeeAddress(frame.payload.srcID);
-                device = Device.byIeeeAddr(ieeeAddr);
+                device = Device.byIeeeAddr(this.database.id, ieeeAddr);
                 frame = await this.#greenPower.processCommand(payload, frame, device?.gpSecurityKey ? Buffer.from(device.gpSecurityKey) : undefined);
 
                 // lookup encapsulated gpDevice for further processing (re-fetch, may have been created by above call)
-                device = Device.byIeeeAddr(ieeeAddr);
+                device = Device.byIeeeAddr(this.database.id, ieeeAddr);
 
                 if (!device) {
                     logger.debug(`Data is from unknown green power device with address '${ieeeAddr}' (${frame.payload.srcID}), skipping...`, NS);
@@ -984,11 +1003,11 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
              * Handling these message would result in false state updates.
              * The group ID attribute of these message defines the network address of the end device.
              */
-            device = Device.find(payload.address);
+            device = Device.find(this.database.id, payload.address);
 
             if (device?.manufacturerName === "LUMI" && device?.type === "Router" && payload.groupID) {
                 logger.debug(`Handling re-transmitted Xiaomi message ${device.networkAddress} -> ${payload.groupID}`, NS);
-                device = Device.byNetworkAddress(payload.groupID);
+                device = Device.byNetworkAddress(this.database.id, payload.groupID);
             }
 
             try {
@@ -999,7 +1018,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         }
 
         if (!device) {
-            if (typeof payload.address === "number" && !Device.isDeletedByNetworkAddress(payload.address)) {
+            if (typeof payload.address === "number" && !Device.isDeletedByNetworkAddress(this.database.id, payload.address)) {
                 device = await this.identifyUnknownDevice(payload.address);
             }
 

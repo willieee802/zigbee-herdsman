@@ -104,6 +104,7 @@ interface ConfiguredReporting {
 }
 
 export class Endpoint extends ZigbeeEntity {
+    private databaseID: number;
     public deviceID?: number;
     public inputClusters: number[];
     public outputClusters: number[];
@@ -126,7 +127,7 @@ export class Endpoint extends ZigbeeEntity {
             // XXX: properties assumed valid when associated to `type`
             const target: Group | Endpoint | undefined =
                 // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-                bind.type === "endpoint" ? Device.byIeeeAddr(bind.deviceIeeeAddress!)?.getEndpoint(bind.endpointID!) : Group.byGroupID(bind.groupID!);
+                bind.type === "endpoint" ? Device.byIeeeAddr(this.databaseID, bind.deviceIeeeAddress!)?.getEndpoint(bind.endpointID!) : Group.byGroupID(bind.groupID!, this.databaseID);
 
             if (target) {
                 binds.push({target, cluster: this.getCluster(bind.cluster)});
@@ -159,6 +160,7 @@ export class Endpoint extends ZigbeeEntity {
     }
 
     private constructor(
+        databaseID: number,
         id: number,
         profileID: number | undefined,
         deviceID: number | undefined,
@@ -172,6 +174,7 @@ export class Endpoint extends ZigbeeEntity {
         meta: KeyValue,
     ) {
         super();
+        this.databaseID = databaseID;
         this.ID = id;
         this.profileID = profileID;
         this.deviceID = deviceID;
@@ -190,7 +193,7 @@ export class Endpoint extends ZigbeeEntity {
      * Get device of this endpoint
      */
     public getDevice(): Device {
-        const device = Device.byIeeeAddr(this.deviceIeeeAddress);
+        const device = Device.byIeeeAddr(this.databaseID, this.deviceIeeeAddress);
 
         if (!device) {
             logger.error(`Tried to get unknown/deleted device ${this.deviceIeeeAddress} from endpoint ${this.ID}.`, NS);
@@ -242,7 +245,7 @@ export class Endpoint extends ZigbeeEntity {
      * CRUD
      */
 
-    public static fromDatabaseRecord(record: KeyValue, deviceNetworkAddress: number, deviceIeeeAddress: string): Endpoint {
+    public static fromDatabaseRecord(record: KeyValue, deviceNetworkAddress: number, deviceIeeeAddress: string, databaseID: number): Endpoint {
         // Migrate attrs to attributes
         for (const entryKey in record.clusters) {
             const entry = record.clusters[entryKey];
@@ -270,6 +273,7 @@ export class Endpoint extends ZigbeeEntity {
         /* v8 ignore stop */
 
         return new Endpoint(
+            databaseID,
             record.epId,
             record.profId,
             record.devId,
@@ -299,6 +303,7 @@ export class Endpoint extends ZigbeeEntity {
     }
 
     public static create(
+        databaseID: number,
         id: number,
         profileID: number | undefined,
         deviceID: number | undefined,
@@ -307,7 +312,7 @@ export class Endpoint extends ZigbeeEntity {
         deviceNetworkAddress: number,
         deviceIeeeAddress: string,
     ): Endpoint {
-        return new Endpoint(id, profileID, deviceID, inputClusters, outputClusters, deviceNetworkAddress, deviceIeeeAddress, {}, [], [], {});
+        return new Endpoint(databaseID, id, profileID, deviceID, inputClusters, outputClusters, deviceNetworkAddress, deviceIeeeAddress, {}, [], [], {});
     }
 
     public saveClusterAttributeKeyValue(clusterKey: number | string, list: KeyValue): void {
@@ -406,7 +411,7 @@ export class Endpoint extends ZigbeeEntity {
         frame: Zcl.Frame,
         options: OptionsWithDefaults,
         func: () => Promise<Type> = (): Promise<Type> => {
-            return Entity.adapter.sendZclFrameToEndpoint(
+            return Entity.getAdapterByID(this.databaseID)?.sendZclFrameToEndpoint(
                 this.deviceIeeeAddress,
                 this.deviceNetworkAddress,
                 this.ID,
@@ -640,8 +645,12 @@ export class Endpoint extends ZigbeeEntity {
 
     public async updateSimpleDescriptor(): Promise<void> {
         const clusterId = Zdo.ClusterId.SIMPLE_DESCRIPTOR_REQUEST;
-        const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, this.deviceNetworkAddress, this.ID);
-        const response = await Entity.adapter.sendZdo(this.deviceIeeeAddress, this.deviceNetworkAddress, clusterId, zdoPayload, false);
+        const adapter = Entity.getAdapterByID(this.databaseID);
+        if (!adapter) {
+            throw new Error(`No adapter found for database ID ${this.databaseID}`);
+        }
+        const zdoPayload = Zdo.Buffalo.buildRequest(adapter.hasZdoMessageOverhead ?? false, clusterId, this.deviceNetworkAddress, this.ID);
+        const response = await adapter.sendZdo(this.deviceIeeeAddress, this.deviceNetworkAddress, clusterId, zdoPayload, false);
 
         if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.SIMPLE_DESCRIPTOR_RESPONSE>(response)) {
             throw new Zdo.StatusError(response[0]);
@@ -667,7 +676,7 @@ export class Endpoint extends ZigbeeEntity {
         const cluster = this.getCluster(clusterKey);
 
         if (typeof target === "number") {
-            target = Group.byGroupID(target) || Group.create(target);
+            target = Group.byGroupID(target, this.databaseID) || Group.create(target, this.databaseID);
         }
 
         this.addBindingInternal(cluster, target);
@@ -694,7 +703,7 @@ export class Endpoint extends ZigbeeEntity {
         const cluster = this.getCluster(clusterKey);
 
         if (typeof target === "number") {
-            target = Group.byGroupID(target) || Group.create(target);
+            target = Group.byGroupID(target, this.databaseID) || Group.create(target, this.databaseID);
         }
 
         const destinationAddress = target instanceof Endpoint ? target.deviceIeeeAddress : target.groupID;
@@ -705,7 +714,7 @@ export class Endpoint extends ZigbeeEntity {
         try {
             const zdoClusterId = Zdo.ClusterId.BIND_REQUEST;
             const zdoPayload = Zdo.Buffalo.buildRequest(
-                Entity.adapter.hasZdoMessageOverhead,
+                Entity.getAdapterByID(this.databaseID)?.hasZdoMessageOverhead ?? false,
                 zdoClusterId,
                 this.deviceIeeeAddress as Eui64,
                 this.ID,
@@ -715,8 +724,11 @@ export class Endpoint extends ZigbeeEntity {
                 target instanceof Group ? target.groupID : 0,
                 target instanceof Endpoint ? target.ID : 0xff,
             );
-
-            const response = await Entity.adapter.sendZdo(this.deviceIeeeAddress, this.deviceNetworkAddress, zdoClusterId, zdoPayload, false);
+            const adapter = Entity.getAdapterByID(this.databaseID);
+            if (!adapter) {
+                throw new Error(`No adapter found for database ID ${this.databaseID}`);
+            }
+            const response = await adapter.sendZdo(this.deviceIeeeAddress, this.deviceNetworkAddress, zdoClusterId, zdoPayload, false);
 
             if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.BIND_RESPONSE>(response)) {
                 throw new Zdo.StatusError(response[0]);
@@ -743,7 +755,7 @@ export class Endpoint extends ZigbeeEntity {
         const action = `Unbind ${this.deviceIeeeAddress}/${this.ID} ${cluster.name}`;
 
         if (typeof target === "number") {
-            const groupTarget = Group.byGroupID(target);
+            const groupTarget = Group.byGroupID(target, this.databaseID);
             if (groupTarget) {
                 target = groupTarget;
             } else if (!force) {
@@ -764,8 +776,12 @@ export class Endpoint extends ZigbeeEntity {
 
         try {
             const zdoClusterId = Zdo.ClusterId.UNBIND_REQUEST;
+            const adapter = Entity.getAdapterByID(this.databaseID);
+            if (!adapter) {
+                throw new Error(`No adapter found for database ID ${this.databaseID}`);
+            }
             const zdoPayload = Zdo.Buffalo.buildRequest(
-                Entity.adapter.hasZdoMessageOverhead,
+                adapter.hasZdoMessageOverhead,
                 zdoClusterId,
                 this.deviceIeeeAddress as Eui64,
                 this.ID,
@@ -776,7 +792,7 @@ export class Endpoint extends ZigbeeEntity {
                 target instanceof Endpoint ? target.ID : 0xff,
             );
 
-            const response = await Entity.adapter.sendZdo(this.deviceIeeeAddress, this.deviceNetworkAddress, zdoClusterId, zdoPayload, false);
+            const response = await adapter.sendZdo(this.deviceIeeeAddress, this.deviceNetworkAddress, zdoClusterId, zdoPayload, false);
 
             if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.UNBIND_RESPONSE>(response)) {
                 if (response[0] === Zdo.Status.NO_ENTRY) {
@@ -984,7 +1000,7 @@ export class Endpoint extends ZigbeeEntity {
             // Broadcast Green Power responses
             if (this.ID === 242) {
                 await this.sendRequest(frame, optionsWithDefaults, async () => {
-                    await Entity.adapter.sendZclFrameToAll(242, frame, 242, BroadcastAddress.RX_ON_WHEN_IDLE);
+                    await Entity.getAdapterByID(this.databaseID)?.sendZclFrameToAll(242, frame, 242, BroadcastAddress.RX_ON_WHEN_IDLE);
                 });
             } else {
                 await this.sendRequest(frame, optionsWithDefaults);
@@ -1113,7 +1129,7 @@ export class Endpoint extends ZigbeeEntity {
     }
 
     public removeFromAllGroupsDatabase(): void {
-        for (const group of Group.allIterator()) {
+        for (const group of Group.allByDatabaseID(this.databaseID)) {
             if (group.hasMember(this)) {
                 group.removeMember(this);
             }
@@ -1212,7 +1228,7 @@ export class Endpoint extends ZigbeeEntity {
         );
 
         // if endpoint===0xFF ("broadcast endpoint"), deliver to all endpoints supporting cluster, should be avoided whenever possible
-        await Entity.adapter.sendZclFrameToAll(endpoint, frame, sourceEndpoint, destination);
+        await Entity.getAdapterByID(this.databaseID)?.sendZclFrameToAll(endpoint, frame, sourceEndpoint, destination);
     }
 }
 

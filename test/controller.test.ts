@@ -9296,8 +9296,9 @@ describe("Controller", () => {
 
         device.removeFromDatabase();
         expect(device.isDeleted).toStrictEqual(true);
-        expect(Device.isDeletedByIeeeAddr("0x0017880104e45517")).toStrictEqual(true);
-        expect(Device.isDeletedByNetworkAddress(nwkAddr)).toStrictEqual(true);
+        const databaseID = controller.getDatabaseId();
+        expect(Device.isDeletedByIeeeAddr(databaseID, "0x0017880104e45517")).toStrictEqual(true);
+        expect(Device.isDeletedByNetworkAddress(databaseID, nwkAddr)).toStrictEqual(true);
 
         const frame2 = Zcl.Frame.create(
             0,

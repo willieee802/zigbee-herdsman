@@ -107,6 +107,7 @@ describe("GreenPower", () => {
                 sendZclFrameToEndpoint: vi.fn(),
                 getNetworkParameters: vi.fn(),
             },
+            1,
         );
     });
 

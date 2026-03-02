@@ -8,6 +8,7 @@ import type * as ZdoTypes from "../zspec/zdo/definition/tstypes";
 import {discoverAdapter} from "./adapterDiscovery";
 import type * as AdapterEvents from "./events";
 import type * as TsType from "./tstype";
+import {KonnextConfig} from "../controller/model/konnextConfig";
 
 interface AdapterEventMap {
     deviceJoined: [payload: AdapterEvents.DeviceJoinedPayload];
@@ -49,6 +50,7 @@ export abstract class Adapter extends events.EventEmitter<AdapterEventMap> {
         serialPortOptions: TsType.SerialPortOptions,
         backupPath: string,
         adapterOptions: TsType.AdapterOptions,
+        konnextConfig: KonnextConfig,
     ): Promise<Adapter> {
         const discovered = await discoverAdapter(serialPortOptions.adapter, serialPortOptions.path);
         serialPortOptions.adapter = discovered.adapter;
@@ -64,7 +66,7 @@ export abstract class Adapter extends events.EventEmitter<AdapterEventMap> {
             case "zstack": {
                 const {ZStackAdapter} = await import("./z-stack/adapter/zStackAdapter.js");
 
-                return new ZStackAdapter(networkOptions, serialPortOptions, backupPath, adapterOptions);
+                return new ZStackAdapter(networkOptions, serialPortOptions, backupPath, adapterOptions, konnextConfig);
             }
             case "ember": {
                 const {EmberAdapter} = await import("./ember/adapter/emberAdapter.js");
