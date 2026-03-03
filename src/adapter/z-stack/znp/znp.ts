@@ -14,6 +14,7 @@ import Definition from "./definition";
 import type {ZpiObjectPayload} from "./tstype";
 import {isMtCmdSreqZdo} from "./utils";
 import {ZpiObject} from "./zpiObject";
+import {KonnextConfig} from "../../../controller/model/konnextConfig";
 
 const {
     COMMON: {ZnpCommandStatus},
@@ -49,8 +50,9 @@ export class Znp extends events.EventEmitter {
     private initialized: boolean;
     private queue: AsyncMutex;
     private waitress: Waitress<ZpiObject, WaitressMatcher>;
+    private konnextConfig: KonnextConfig;
 
-    public constructor(path: string, baudRate: number, rtscts: boolean) {
+    public constructor(path: string, baudRate: number, rtscts: boolean, konnextConfig: KonnextConfig) {
         super();
 
         this.path = path;
@@ -62,7 +64,8 @@ export class Znp extends events.EventEmitter {
         this.queue = new AsyncMutex();
         this.waitress = new Waitress<ZpiObject, WaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
         this.unpiWriter = new UnpiWriter();
-        this.unpiParser = new UnpiParser();
+        this.unpiParser = new UnpiParser(konnextConfig);
+        this.konnextConfig = konnextConfig;
     }
 
     private onUnpiParsed(frame: UnpiFrame): void {
@@ -175,7 +178,7 @@ export class Znp extends events.EventEmitter {
             // and give ZNP 1 second to start.
             try {
                 logger.info("Writing CC2530/CC2531 skip bootloader payload", NS);
-                this.unpiWriter.writeBuffer(Buffer.from([0xef]));
+                this.unpiWriter.writeBuffer(Buffer.from([0xef]), this.konnextConfig);
                 await wait(1000);
                 await this.request(Subsystem.SYS, "ping", {capabilities: 1}, undefined, 250 /* v8 ignore next */);
             } catch {
@@ -252,7 +255,7 @@ export class Znp extends events.EventEmitter {
             if (object.type === Type.SREQ) {
                 const t = object.command.name === "bdbStartCommissioning" || object.command.name === "startupFromApp" ? 40000 : timeouts.SREQ;
                 const waiter = this.waitress.waitFor({type: Type.SRSP, subsystem: object.subsystem, command: object.command.name}, timeout || t);
-                this.unpiWriter.writeFrame(object.unpiFrame);
+                this.unpiWriter.writeFrame(object.unpiFrame, this.konnextConfig);
                 const result = await waiter.start().promise;
                 if (result?.payload.status !== undefined && !expectedStatuses.includes(result.payload.status)) {
                     if (typeof waiterID === "number") {
@@ -272,12 +275,12 @@ export class Znp extends events.EventEmitter {
             if (object.type === Type.AREQ && object.isResetCommand()) {
                 const waiter = this.waitress.waitFor({type: Type.AREQ, subsystem: Subsystem.SYS, command: "resetInd"}, timeout || timeouts.reset);
                 this.queue.clear();
-                this.unpiWriter.writeFrame(object.unpiFrame);
+                this.unpiWriter.writeFrame(object.unpiFrame, this.konnextConfig);
                 return await waiter.start().promise;
             }
 
             if (object.type === Type.AREQ) {
-                this.unpiWriter.writeFrame(object.unpiFrame);
+                this.unpiWriter.writeFrame(object.unpiFrame, this.konnextConfig);
                 /* v8 ignore start */
             } else {
                 throw new Error(`Unknown type '${object.type}'`);
@@ -294,7 +297,7 @@ export class Znp extends events.EventEmitter {
             const unpiFrame = new UnpiFrame(Type.SREQ, Subsystem.ZDO, cmd.ID, payload);
             const waiter = this.waitress.waitFor({type: Type.SRSP, subsystem: Subsystem.ZDO, command: cmd.name}, timeouts.SREQ);
 
-            this.unpiWriter.writeFrame(unpiFrame);
+            this.unpiWriter.writeFrame(unpiFrame, this.konnextConfig);
 
             const result = await waiter.start().promise;
 

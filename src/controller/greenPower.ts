@@ -109,10 +109,12 @@ interface GreenPowerEventMap {
 
 export class GreenPower extends EventEmitter<GreenPowerEventMap> {
     private adapter: Adapter;
+    private databaseID: number;
 
-    public constructor(adapter: Adapter) {
+    public constructor(adapter: Adapter, databaseID: number) {
         super();
         this.adapter = adapter;
+        this.databaseID = databaseID;
     }
 
     public static sourceIdToIeeeAddress(sourceId: number): string {
@@ -227,7 +229,7 @@ export class GreenPower extends EventEmitter<GreenPowerEventMap> {
             return;
         }
 
-        const device = Device.byNetworkAddress(gppNwkAddr ?? /* v8 ignore next */ COORDINATOR_ADDRESS);
+        const device = Device.byNetworkAddress(this.databaseID, gppNwkAddr ?? /* v8 ignore next */ COORDINATOR_ADDRESS);
         assert(device, "Failed to find green power proxy device");
 
         return await this.adapter.sendZclFrameToEndpoint(
@@ -600,7 +602,7 @@ export class GreenPower extends EventEmitter<GreenPowerEventMap> {
         if (networkAddress === undefined) {
             await this.adapter.sendZclFrameToAll(GP_ENDPOINT, frame, GP_ENDPOINT, BroadcastAddress.RX_ON_WHEN_IDLE);
         } else {
-            const device = Device.byNetworkAddress(networkAddress);
+            const device = Device.byNetworkAddress(this.databaseID, networkAddress);
             assert(device, "Failed to find device to permit GP join on");
 
             await this.adapter.sendZclFrameToEndpoint(device.ieeeAddr, networkAddress, GP_ENDPOINT, frame, 10000, false, false, GP_ENDPOINT);

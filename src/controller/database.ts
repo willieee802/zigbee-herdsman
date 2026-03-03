@@ -2,18 +2,34 @@ import fs from "node:fs";
 
 import {logger} from "../utils/logger";
 import type {DatabaseEntry, EntityType} from "./tstype";
+import {Entity} from './model';
 
 const NS = "zh:controller:database";
 
 export class Database {
+    private _id: number;
     private entries: Map<number, DatabaseEntry>;
     private path: string;
     private maxId: number;
 
+    public get id(): number {
+        return this._id;
+    }
+
     private constructor(entries: Map<number, DatabaseEntry>, path: string, maxId: number) {
+        this._id = this.generateDatabaseID();
         this.entries = entries;
         this.path = path;
         this.maxId = maxId;
+    }
+
+    private generateDatabaseID(): number {
+        for (let i = 1; i < 100000; i++) {
+            if (!Entity.databaseIDExists(i)) {
+                return i;
+            }
+        }
+        return 100001;
     }
 
     public static open(path: string): Database {

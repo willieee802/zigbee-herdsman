@@ -34,6 +34,7 @@ interface OptionsWithDefaults extends Options {
 
 export class Group extends ZigbeeEntity {
     private databaseID: number;
+    private ID: number;
     public readonly groupID: number;
     private readonly _members: Endpoint[];
     #customClusters: [input: CustomClusters, output: CustomClusters];
@@ -42,7 +43,7 @@ export class Group extends ZigbeeEntity {
 
     // This lookup contains all groups that are queried from the database, this is to ensure that always
     // the same instance is returned.
-    private static readonly groups: Map<number /* groupID */, Group> = new Map();
+    private static readonly groups: Map<number, Map<number, Group>> = new Map();
     private static loadedFromDatabase = false;
 
     /** Member endpoints with valid devices (not unknown/deleted) */
@@ -55,9 +56,10 @@ export class Group extends ZigbeeEntity {
         return this.#customClusters;
     }
 
-    private constructor(databaseID: number, groupID: number, members: Endpoint[], meta: KeyValue) {
+    private constructor(databaseID: number, ID: number, groupID: number, members: Endpoint[], meta: KeyValue) {
         super();
         this.databaseID = databaseID;
+        this.ID = ID;
         this.groupID = groupID;
         this._members = members;
         this.meta = meta;
@@ -76,12 +78,12 @@ export class Group extends ZigbeeEntity {
         Group.loadedFromDatabase = false;
     }
 
-    private static fromDatabaseEntry(entry: DatabaseEntry): Group {
+    private static fromDatabaseEntry(entry: DatabaseEntry, databaseID: number): Group {
         // db is expected to never contain duplicate, so no need for explicit check
         const members: Endpoint[] = [];
 
         for (const member of entry.members) {
-            const device = Device.byIeeeAddr(member.deviceIeeeAddr);
+            const device = Device.byIeeeAddr(databaseID, member.deviceIeeeAddr);
 
             if (device) {
                 const endpoint = device.getEndpoint(member.endpointID);
@@ -92,7 +94,7 @@ export class Group extends ZigbeeEntity {
             }
         }
 
-        return new Group(entry.id, entry.groupID, members, entry.meta);
+        return new Group(databaseID, entry.id, entry.groupID, members, entry.meta);
     }
 
     private toDatabaseRecord(): DatabaseEntry {
@@ -106,44 +108,52 @@ export class Group extends ZigbeeEntity {
             }
         }
 
-        return {id: this.databaseID, type: "Group", groupID: this.groupID, members, meta: this.meta};
+        return {id: this.ID, type: "Group", groupID: this.groupID, members, meta: this.meta};
     }
 
     private static loadFromDatabaseIfNecessary(): void {
         if (!Group.loadedFromDatabase) {
-            for (const entry of Entity.database.getEntriesIterator(["Group"])) {
-                const group = Group.fromDatabaseEntry(entry);
-                Group.groups.set(group.groupID, group);
-            }
+            Entity.databases.forEach(database => {
+                if (!Group.groups.get(database.id)) {
+                    Group.groups.set(database.id, new Map());
+                }
+                const entries = database.getEntriesIterator(['Group']);
+                for (const entry of entries) {
+                    const group = Group.fromDatabaseEntry(entry, database.id);
+                    Group.groups.get(database.id)?.set(group.groupID, group);
+                }
+            });
 
             Group.loadedFromDatabase = true;
         }
     }
 
-    public static byGroupID(groupID: number): Group | undefined {
+    public static byGroupID(groupID: number, databaseID: number): Group | undefined {
         Group.loadFromDatabaseIfNecessary();
-        return Group.groups.get(groupID);
+        return Group.groups.get(databaseID)?.get(groupID);
     }
 
-    /**
-     * @deprecated use allIterator()
-     */
-    public static all(): Group[] {
+    // public static all(): Group[] {
+    //     Group.loadFromDatabaseIfNecessary();
+    //     return Array.from(Group.groups.values());
+    // }
+
+    public static allByDatabaseID(databaseID: number): Group[] {
         Group.loadFromDatabaseIfNecessary();
-        return Array.from(Group.groups.values());
+        return Array.from(Group.groups.get(databaseID)?.values() ?? []);
     }
 
-    public static *allIterator(predicate?: (value: Group) => boolean): Generator<Group> {
+    public static *allIterator(databaseID: number, predicate?: (value: Group) => boolean): Generator<Group> {
         Group.loadFromDatabaseIfNecessary();
 
-        for (const group of Group.groups.values()) {
+        for (const group of Group.groups.get(databaseID)?.values() ?? []) {
             if (!predicate || predicate(group)) {
                 yield group;
             }
         }
     }
 
-    public static create(groupID: number): Group {
+    public static create(groupID: number, databaseID: number): Group {
         assert(typeof groupID === "number", "GroupID must be a number");
         // Don't allow groupID 0, from the spec:
         // "Scene identifier 0x00, along with group identifier 0x0000, is reserved for the global scene used by the OnOff cluster"
@@ -151,15 +161,19 @@ export class Group extends ZigbeeEntity {
 
         Group.loadFromDatabaseIfNecessary();
 
-        if (Group.groups.has(groupID)) {
+        if (Group.groups.get(databaseID)?.has(groupID)) {
             throw new Error(`Group with groupID '${groupID}' already exists`);
         }
 
-        const databaseID = Entity.database.newID();
-        const group = new Group(databaseID, groupID, [], {});
-        Entity.database.insert(group.toDatabaseRecord());
+        const database = Entity.getDatabaseByID(databaseID);
+        if (!database) {
+            throw new Error(`Database with ID '${databaseID}' not found`);
+        }
+        const ID = database.newID();
+        const group = new Group(databaseID, ID, groupID, [], {});
+        database.insert(group.toDatabaseRecord());
 
-        Group.groups.set(group.groupID, group);
+        Group.groups.get(databaseID)?.set(group.groupID, group);
         return group;
     }
 
@@ -173,16 +187,19 @@ export class Group extends ZigbeeEntity {
 
     public removeFromDatabase(): void {
         Group.loadFromDatabaseIfNecessary();
-
-        if (Entity.database.has(this.databaseID)) {
-            Entity.database.remove(this.databaseID);
+        const database = Entity.getDatabaseByID(this.databaseID);
+        if (database?.has(this.ID)) {
+            database.remove(this.ID);
         }
 
-        Group.groups.delete(this.groupID);
+        Group.groups.get(this.databaseID)?.delete(this.groupID);
     }
 
     public save(writeDatabase = true): void {
-        Entity.database.update(this.toDatabaseRecord(), writeDatabase);
+        const database = Entity.getDatabaseByID(this.databaseID);
+        if (database) {
+            database.update(this.toDatabaseRecord(), writeDatabase);
+        }
     }
 
     public addMember(endpoint: Endpoint): void {
@@ -301,7 +318,7 @@ export class Group extends ZigbeeEntity {
                 optionsWithDefaults.reservedBits,
             );
 
-            await Entity.adapter.sendZclFrameToGroup(this.groupID, frame, optionsWithDefaults.srcEndpoint);
+            await Entity.getAdapterByID(this.databaseID)?.sendZclFrameToGroup(this.groupID, frame, optionsWithDefaults.srcEndpoint);
         } catch (error) {
             const err = error as Error;
             err.message = `${createLogMessage()} failed (${err.message})`;
@@ -357,7 +374,7 @@ export class Group extends ZigbeeEntity {
         logger.debug(createLogMessage, NS);
 
         try {
-            await Entity.adapter.sendZclFrameToGroup(this.groupID, frame, optionsWithDefaults.srcEndpoint);
+            await Entity.getAdapterByID(this.databaseID)?.sendZclFrameToGroup(this.groupID, frame, optionsWithDefaults.srcEndpoint);
         } catch (error) {
             const err = error as Error;
             err.message = `${createLogMessage()} failed (${err.message})`;
@@ -399,7 +416,7 @@ export class Group extends ZigbeeEntity {
                 optionsWithDefaults.reservedBits,
             );
 
-            await Entity.adapter.sendZclFrameToGroup(this.groupID, frame, optionsWithDefaults.srcEndpoint);
+            await Entity.getAdapterByID(this.databaseID)?.sendZclFrameToGroup(this.groupID, frame, optionsWithDefaults.srcEndpoint);
         } catch (error) {
             const err = error as Error;
             err.message = `${createLogMessage()} failed (${err.message})`;

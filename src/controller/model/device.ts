@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import type {Events as AdapterEvents} from "../../adapter";
+import {Events as AdapterEvents} from '../../adapter';
 import {wait} from "../../utils";
 import {logger} from "../../utils/logger";
 import * as timeService from "../../utils/timeService";
@@ -53,6 +53,7 @@ export enum InterviewState {
 }
 
 export class Device extends Entity<ControllerEventMap> {
+    private databaseID: number;
     // biome-ignore lint/style/useNamingConvention: cross-repo impact
     private readonly ID: number;
     #genBasic: TPartialClusterAttributes<"genBasic"> = {};
@@ -100,7 +101,7 @@ export class Device extends Entity<ControllerEventMap> {
         return this._manufacturerID;
     }
     get isDeleted(): boolean {
-        return Device.deletedDevices.has(this.ieeeAddr);
+        return Device.deletedDevices.get(this.databaseID)?.has(this.ieeeAddr) ?? false;
     }
     set type(type: DeviceType) {
         this._type = type;
@@ -136,11 +137,11 @@ export class Device extends Entity<ControllerEventMap> {
         return this._networkAddress;
     }
     set networkAddress(networkAddress: number) {
-        Device.nwkToIeeeCache.delete(this._networkAddress);
+        Device.nwkToIeeeCache.get(this.databaseID)?.delete(this._networkAddress);
 
         this._networkAddress = networkAddress;
 
-        Device.nwkToIeeeCache.set(this._networkAddress, this.ieeeAddr);
+        Device.nwkToIeeeCache.get(this.databaseID)?.set(this._networkAddress, this.ieeeAddr);
 
         for (const endpoint of this._endpoints) {
             endpoint.deviceNetworkAddress = networkAddress;
@@ -233,12 +234,13 @@ export class Device extends Entity<ControllerEventMap> {
 
     // This lookup contains all devices that are queried from the database, this is to ensure that always
     // the same instance is returned.
-    private static readonly devices: Map<string /* IEEE */, Device> = new Map();
+    private static readonly devices: Map<number, Map<string, Device>> = new Map<number, Map<string, Device>>();
     private static loadedFromDatabase = false;
-    private static readonly deletedDevices: Map<string /* IEEE */, Device> = new Map();
-    private static readonly nwkToIeeeCache: Map<number /* nwk addr */, string /* IEEE */> = new Map();
+    private static readonly deletedDevices: Map<number /* databaseID */, Map<string /* IEEE */, Device>> = new Map();
+    private static readonly nwkToIeeeCache: Map<number /* databaseID */, Map<number /* nwk addr */, string /* IEEE */>> = new Map();
 
     private constructor(
+        databaseID: number,
         id: number,
         type: DeviceType,
         ieeeAddr: string,
@@ -263,6 +265,7 @@ export class Device extends Entity<ControllerEventMap> {
         scheduledOta: OtaSource | undefined,
     ) {
         super();
+        this.databaseID = databaseID;
         this.ID = id;
         this._type = type;
         this._ieeeAddr = ieeeAddr;
@@ -293,17 +296,19 @@ export class Device extends Entity<ControllerEventMap> {
             throw new Error(`Device '${this.ieeeAddr}' already has an endpoint '${id}'`);
         }
 
-        const endpoint = Endpoint.create(id, undefined, undefined, [], [], this.networkAddress, this.ieeeAddr);
+        const endpoint = Endpoint.create(this.databaseID, id, undefined, undefined, [], [],
+            this.networkAddress, this.ieeeAddr
+        );
         this.endpoints.push(endpoint);
         this.save();
         return endpoint;
     }
 
     public changeIeeeAddress(ieeeAddr: string): void {
-        Device.devices.delete(this.ieeeAddr);
+        Device.devices.get(this.databaseID)?.delete(this.ieeeAddr);
         this.ieeeAddr = ieeeAddr;
-        Device.devices.set(this.ieeeAddr, this);
-        Device.nwkToIeeeCache.set(this.networkAddress, this.ieeeAddr);
+        Device.devices.get(this.databaseID)?.set(this.ieeeAddr, this);
+        Device.nwkToIeeeCache.get(this.databaseID)?.set(this.networkAddress, this.ieeeAddr);
         for (const ep of this.endpoints) {
             ep.deviceIeeeAddress = ieeeAddr;
         }
@@ -345,7 +350,7 @@ export class Device extends Entity<ControllerEventMap> {
     }
 
     public async onZclData(dataPayload: AdapterEvents.ZclPayload, frame: Zcl.Frame, endpoint: Endpoint): Promise<void> {
-        if (!Device.devices.has(this.ieeeAddr)) {
+        if (!Device.devices.get(this.databaseID)?.has(this.ieeeAddr)) {
             // prevent race conditions where device gets deleted during processing
             return;
         }
@@ -501,13 +506,13 @@ export class Device extends Entity<ControllerEventMap> {
         Device.nwkToIeeeCache.clear();
     }
 
-    private static fromDatabaseEntry(entry: DatabaseEntry): Device {
+    private static fromDatabaseEntry(entry: DatabaseEntry, databaseID: number): Device {
         const networkAddress = entry.nwkAddr;
         const ieeeAddr = entry.ieeeAddr;
         const endpoints: Endpoint[] = [];
 
         for (const id in entry.endpoints) {
-            endpoints.push(Endpoint.fromDatabaseRecord(entry.endpoints[id], networkAddress, ieeeAddr));
+            endpoints.push(Endpoint.fromDatabaseRecord(entry.endpoints[id], networkAddress, ieeeAddr, databaseID));
         }
 
         const meta = entry.meta ?? {};
@@ -536,6 +541,7 @@ export class Device extends Entity<ControllerEventMap> {
         }
 
         return new Device(
+            databaseID,
             entry.id,
             entry.type,
             ieeeAddr,
@@ -598,80 +604,83 @@ export class Device extends Entity<ControllerEventMap> {
     }
 
     public save(writeDatabase = true): void {
-        Entity.database.update(this.toDatabaseEntry(), writeDatabase);
+        Entity.getDatabaseByID(this.databaseID)?.update(this.toDatabaseEntry(), writeDatabase);
     }
 
     private static loadFromDatabaseIfNecessary(): void {
         if (!Device.loadedFromDatabase) {
-            for (const entry of Entity.database.getEntriesIterator(["Coordinator", "EndDevice", "Router", "GreenPower", "Unknown"])) {
-                const device = Device.fromDatabaseEntry(entry);
-
-                Device.devices.set(device.ieeeAddr, device);
-                Device.nwkToIeeeCache.set(device.networkAddress, device.ieeeAddr);
-            }
+            Entity.databases.forEach(database => {
+                if (!Device.devices.has(database.id)) {
+                    Device.devices.set(database.id, new Map<string, Device>());
+                    Device.deletedDevices.set(database.id, new Map<string, Device>());
+                    Device.nwkToIeeeCache.set(database.id, new Map<number, string>());
+                    const entries = database.getEntriesIterator(['Coordinator', 'EndDevice', 'Router', 'GreenPower', 'Unknown']);
+                    for (const entry of entries) {
+                        const device = Device.fromDatabaseEntry(entry, database.id);
+                        Device.devices.get(database.id)!.set(device.ieeeAddr, device);
+                        Device.nwkToIeeeCache.get(database.id)!.set(device.networkAddress, device.ieeeAddr);
+                    }
+                }
+            });
 
             Device.loadedFromDatabase = true;
         }
     }
 
-    public static find(ieeeOrNwkAddress: string | number, includeDeleted = false): Device | undefined {
+    public static find(databaseID: number, ieeeOrNwkAddress: string | number, includeDeleted = false): Device | undefined {
         return typeof ieeeOrNwkAddress === "string"
-            ? Device.byIeeeAddr(ieeeOrNwkAddress, includeDeleted)
-            : Device.byNetworkAddress(ieeeOrNwkAddress, includeDeleted);
+            ? Device.byIeeeAddr(databaseID, ieeeOrNwkAddress, includeDeleted)
+            : Device.byNetworkAddress(databaseID, ieeeOrNwkAddress, includeDeleted);
     }
 
-    public static byIeeeAddr(ieeeAddr: string, includeDeleted = false): Device | undefined {
+    public static byIeeeAddr(databaseID: number, ieeeAddr: string, includeDeleted = false): Device | undefined {
+        Device.loadFromDatabaseIfNecessary();
+        const device = Device.devices.get(databaseID)?.get(ieeeAddr);
+        return includeDeleted ? (Device.deletedDevices.get(databaseID)?.get(ieeeAddr) ?? device) : device;
+    }
+
+    public static byNetworkAddress(databaseID: number, networkAddress: number, includeDeleted = false): Device | undefined {
         Device.loadFromDatabaseIfNecessary();
 
-        return includeDeleted ? (Device.deletedDevices.get(ieeeAddr) ?? Device.devices.get(ieeeAddr)) : Device.devices.get(ieeeAddr);
+        const ieeeAddr = Device.nwkToIeeeCache.get(databaseID)?.get(networkAddress);
+
+        return ieeeAddr ? Device.byIeeeAddr(databaseID, ieeeAddr, includeDeleted) : undefined;
     }
 
-    public static byNetworkAddress(networkAddress: number, includeDeleted = false): Device | undefined {
+    public static byType(databaseID: number, type: DeviceType): Device[] {
+        return Device.allByDatabaseID(databaseID).filter(d => d.type === type);
+    }
+
+    public static allByDatabaseID(databaseID: number): Device[] {
         Device.loadFromDatabaseIfNecessary();
-
-        const ieeeAddr = Device.nwkToIeeeCache.get(networkAddress);
-
-        return ieeeAddr ? Device.byIeeeAddr(ieeeAddr, includeDeleted) : undefined;
-    }
-
-    public static byType(type: DeviceType): Device[] {
-        const devices: Device[] = [];
-
-        for (const device of Device.allIterator((d) => d.type === type)) {
-            devices.push(device);
-        }
-
-        return devices;
+        return Array.from(Device.devices.get(databaseID)?.values() ?? []);
     }
 
     /** Check if a device is explicitly deleted */
-    public static isDeletedByIeeeAddr(ieeeAddr: string): boolean {
+    public static isDeletedByIeeeAddr(databaseID: number, ieeeAddr: string): boolean {
         Device.loadFromDatabaseIfNecessary();
 
-        return Device.deletedDevices.has(ieeeAddr);
+        return Device.deletedDevices.get(databaseID)?.has(ieeeAddr) ?? false;
     }
 
     /** Check if a device is explicitly deleted */
-    public static isDeletedByNetworkAddress(networkAddress: number): boolean {
+    public static isDeletedByNetworkAddress(databaseID: number, networkAddress: number): boolean {
         Device.loadFromDatabaseIfNecessary();
 
-        const ieeeAddr = Device.nwkToIeeeCache.get(networkAddress);
+        const ieeeAddr = Device.nwkToIeeeCache.get(databaseID)?.get(networkAddress);
 
-        return ieeeAddr ? Device.deletedDevices.has(ieeeAddr) : false;
+        return ieeeAddr ? Device.deletedDevices.get(databaseID)?.has(ieeeAddr) ?? false : false;
     }
 
-    /**
-     * @deprecated use allIterator()
-     */
-    public static all(): Device[] {
-        Device.loadFromDatabaseIfNecessary();
-        return Array.from(Device.devices.values());
-    }
+    // public static all(): Device[] {
+    //     Device.loadFromDatabaseIfNecessary();
+    //     return Array.from(Device.devices.values());
+    // }
 
-    public static *allIterator(predicate?: (value: Device) => boolean): Generator<Device> {
+    public static *allIterator(databaseID: number, predicate?: (value: Device) => boolean): Generator<Device> {
         Device.loadFromDatabaseIfNecessary();
 
-        for (const device of Device.devices.values()) {
+        for (const device of Device.allByDatabaseID(databaseID)) {
             if (!predicate || predicate(device)) {
                 yield device;
             }
@@ -679,10 +688,10 @@ export class Device extends Entity<ControllerEventMap> {
     }
 
     public undelete(): void {
-        if (Device.deletedDevices.delete(this.ieeeAddr)) {
-            Device.devices.set(this.ieeeAddr, this);
+        if (Device.deletedDevices.get(this.databaseID)?.delete(this.ieeeAddr)) {
+            Device.devices.get(this.databaseID)?.set(this.ieeeAddr, this);
 
-            Entity.database.insert(this.toDatabaseEntry());
+            Entity.getDatabaseByID(this.databaseID)?.insert(this.toDatabaseEntry());
         } else {
             throw new Error(`Device '${this.ieeeAddr}' is not deleted`);
         }
@@ -698,15 +707,21 @@ export class Device extends Entity<ControllerEventMap> {
         modelID: string | undefined,
         interviewState: InterviewState,
         gpSecurityKey: number[] | undefined,
+        databaseID: number,
     ): Device {
         Device.loadFromDatabaseIfNecessary();
 
-        if (Device.devices.has(ieeeAddr)) {
+        if (Device.devices.get(databaseID)?.has(ieeeAddr)) {
             throw new Error(`Device with IEEE address '${ieeeAddr}' already exists`);
         }
+        const database = Entity.getDatabaseByID(databaseID);
+        if (!database) {
+            throw new Error(`Database with ID '${databaseID}' not found`);
+        }
 
-        const ID = Entity.database.newID();
+        const ID = database.newID();
         const device = new Device(
+            databaseID,
             ID,
             type,
             ieeeAddr,
@@ -731,9 +746,9 @@ export class Device extends Entity<ControllerEventMap> {
             undefined,
         );
 
-        Entity.database.insert(device.toDatabaseEntry());
-        Device.devices.set(device.ieeeAddr, device);
-        Device.nwkToIeeeCache.set(device.networkAddress, device.ieeeAddr);
+        database.insert(device.toDatabaseEntry());
+        Device.devices.get(databaseID)?.set(device.ieeeAddr, device);
+        Device.nwkToIeeeCache.get(databaseID)?.set(device.networkAddress, device.ieeeAddr);
         return device;
     }
 
@@ -892,7 +907,7 @@ export class Device extends Entity<ControllerEventMap> {
             // https://github.com/Koenkk/zigbee2mqtt/issues/7553
             logger.debug("Interview - Detected potential Tuya end device, reading modelID and manufacturerName...", NS);
             try {
-                const endpoint = Endpoint.create(1, undefined, undefined, [], [], this.networkAddress, this.ieeeAddr);
+                const endpoint = Endpoint.create(this.databaseID, 1, undefined, undefined, [], [], this.networkAddress, this.ieeeAddr);
                 const result = await endpoint.read("genBasic", ["modelId", "manufacturerName"], {sendPolicy: "immediate"});
 
                 this.updateGenBasic(result);
@@ -921,7 +936,7 @@ export class Device extends Entity<ControllerEventMap> {
 
         logger.debug(`Interview - got active endpoints for device '${this.ieeeAddr}'`, NS);
 
-        const coordinator = Device.byType("Coordinator")[0];
+        const coordinator = Device.byType(this.databaseID, "Coordinator")[0];
 
         for (const endpoint of this._endpoints) {
             await endpoint.updateSimpleDescriptor();
@@ -971,7 +986,7 @@ export class Device extends Entity<ControllerEventMap> {
                 if (stateBefore.zoneState !== 1 || stateBefore.iasCieAddr !== coordinator.ieeeAddr) {
                     logger.debug("Interview - IAS - not enrolled, enrolling", NS);
 
-                    await endpoint.write("ssIasZone", {iasCieAddr: coordinator.ieeeAddr}, {sendPolicy: "immediate"});
+                    await endpoint.write("ssIasZone", {iasCieAddr: coordinator.ieeeAddr}, {disableDefaultResponse: true, sendPolicy: "immediate"});
                     logger.debug("Interview - IAS - wrote iasCieAddr", NS);
 
                     // There are 2 enrollment procedures:
@@ -1025,8 +1040,12 @@ export class Device extends Entity<ControllerEventMap> {
 
     public async updateNodeDescriptor(): Promise<void> {
         const clusterId = Zdo.ClusterId.NODE_DESCRIPTOR_REQUEST;
-        const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, this.networkAddress);
-        const response = await Entity.adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+        const adapter = Entity.getAdapterByID(this.databaseID);
+        if (!adapter) {
+            throw new Error(`No adapter found for database ID ${this.databaseID}`);
+        }
+        const zdoPayload = Zdo.Buffalo.buildRequest(adapter.hasZdoMessageOverhead, clusterId, this.networkAddress);
+        const response = await adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
 
         if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.NODE_DESCRIPTOR_RESPONSE>(response)) {
             throw new Zdo.StatusError(response[0]);
@@ -1064,10 +1083,14 @@ export class Device extends Entity<ControllerEventMap> {
     }
 
     public async updateActiveEndpoints(): Promise<void> {
+        const adapter = Entity.getAdapterByID(this.databaseID);
+        if (!adapter) {
+            throw new Error(`No adapter found for database ID ${this.databaseID}`);
+        }
         const clusterId = Zdo.ClusterId.ACTIVE_ENDPOINTS_REQUEST;
-        const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, this.networkAddress);
+        const zdoPayload = Zdo.Buffalo.buildRequest(adapter.hasZdoMessageOverhead, clusterId, this.networkAddress);
 
-        const response = await Entity.adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+        const response = await adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
 
         if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.ACTIVE_ENDPOINTS_RESPONSE>(response)) {
             throw new Zdo.StatusError(response[0]);
@@ -1082,7 +1105,7 @@ export class Device extends Entity<ControllerEventMap> {
             // This is not a valid endpoint number according to the ZCL, requesting a simple descriptor will result
             // into an error. Therefore we filter it, more info: https://github.com/Koenkk/zigbee-herdsman/issues/82
             if (endpoint !== 0 && !this.getEndpoint(endpoint)) {
-                this._endpoints.push(Endpoint.create(endpoint, undefined, undefined, [], [], this.networkAddress, this.ieeeAddr));
+                this._endpoints.push(Endpoint.create(this.databaseID, endpoint, undefined, undefined, [], [], this.networkAddress, this.ieeeAddr));
             }
         }
 
@@ -1096,12 +1119,20 @@ export class Device extends Entity<ControllerEventMap> {
      */
     public async requestNetworkAddress(): Promise<void> {
         const clusterId = Zdo.ClusterId.NETWORK_ADDRESS_REQUEST;
-        const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, this.ieeeAddr as Eui64, false, 0);
+        const adapter = Entity.getAdapterByID(this.databaseID);
+        if (!adapter) {
+            throw new Error(`No adapter found for database ID ${this.databaseID}`);
+        }
+        const zdoPayload = Zdo.Buffalo.buildRequest(adapter.hasZdoMessageOverhead, clusterId, this.ieeeAddr as Eui64, false, 0);
 
-        await Entity.adapter.sendZdo(this.ieeeAddr, ZSpec.BroadcastAddress.RX_ON_WHEN_IDLE, clusterId, zdoPayload, true);
+        await adapter.sendZdo(this.ieeeAddr, ZSpec.BroadcastAddress.RX_ON_WHEN_IDLE, clusterId, zdoPayload, true);
     }
 
     public async removeFromNetwork(): Promise<void> {
+        const adapter = Entity.getAdapterByID(this.databaseID);
+        if (!adapter) {
+            throw new Error(`No adapter found for database ID ${this.databaseID}`);
+        }
         if (this._type === "GreenPower") {
             const payload = {
                 options: 0x002550,
@@ -1119,16 +1150,16 @@ export class Device extends Entity<ControllerEventMap> {
                 this.customClusters,
             );
 
-            await Entity.adapter.sendZclFrameToAll(242, frame, 242, BroadcastAddress.RX_ON_WHEN_IDLE);
+            await adapter.sendZclFrameToAll(242, frame, 242, BroadcastAddress.RX_ON_WHEN_IDLE);
         } else {
             const clusterId = Zdo.ClusterId.LEAVE_REQUEST;
             const zdoPayload = Zdo.Buffalo.buildRequest(
-                Entity.adapter.hasZdoMessageOverhead,
+                adapter.hasZdoMessageOverhead,
                 clusterId,
                 this.ieeeAddr as Eui64,
                 Zdo.LeaveRequestFlags.WITHOUT_REJOIN,
             );
-            const response = await Entity.adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+            const response = await adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
 
             if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.LEAVE_RESPONSE>(response)) {
                 throw new Zdo.StatusError(response[0]);
@@ -1144,13 +1175,13 @@ export class Device extends Entity<ControllerEventMap> {
         for (const endpoint of this.endpoints) {
             endpoint.removeFromAllGroupsDatabase();
         }
-
-        if (Entity.database.has(this.ID)) {
-            Entity.database.remove(this.ID);
+        const database = Entity.getDatabaseByID(this.databaseID);
+        if (database?.has(this.ID)) {
+            database.remove(this.ID);
         }
 
-        Device.deletedDevices.set(this.ieeeAddr, this);
-        Device.devices.delete(this.ieeeAddr);
+        Device.deletedDevices.get(this.databaseID)?.set(this.ieeeAddr, this);
+        Device.devices.get(this.databaseID)?.delete(this.ieeeAddr);
 
         // Clear all data in case device joins again
         // Green power devices are never interviewed, keep existing interview state.
@@ -1160,6 +1191,7 @@ export class Device extends Entity<ControllerEventMap> {
         for (const endpoint of this.endpoints) {
             newEndpoints.push(
                 Endpoint.create(
+                    this.databaseID,
                     endpoint.ID,
                     endpoint.profileID,
                     endpoint.deviceID,
@@ -1174,11 +1206,15 @@ export class Device extends Entity<ControllerEventMap> {
     }
 
     public async lqi(): Promise<LQITableEntry[]> {
+        const adapter = Entity.getAdapterByID(this.databaseID);
+        if (!adapter) {
+            throw new Error(`No adapter found for database ID ${this.databaseID}`);
+        }
         const clusterId = Zdo.ClusterId.LQI_TABLE_REQUEST;
         const table: LQITableEntry[] = [];
         const request = async (startIndex: number): Promise<[tableEntries: number, entryCount: number]> => {
-            const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, startIndex);
-            const response = await Entity.adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+            const zdoPayload = Zdo.Buffalo.buildRequest(adapter.hasZdoMessageOverhead, clusterId, startIndex);
+            const response = await adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
 
             if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.LQI_TABLE_RESPONSE>(response)) {
                 throw new Zdo.StatusError(response[0]);
@@ -1206,11 +1242,15 @@ export class Device extends Entity<ControllerEventMap> {
     }
 
     public async routingTable(): Promise<RoutingTableEntry[]> {
+        const adapter = Entity.getAdapterByID(this.databaseID);
+        if (!adapter) {
+            throw new Error(`No adapter found for database ID ${this.databaseID}`);
+        }
         const clusterId = Zdo.ClusterId.ROUTING_TABLE_REQUEST;
         const table: RoutingTableEntry[] = [];
         const request = async (startIndex: number): Promise<[tableEntries: number, entryCount: number]> => {
-            const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, startIndex);
-            const response = await Entity.adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+            const zdoPayload = Zdo.Buffalo.buildRequest(adapter.hasZdoMessageOverhead, clusterId, startIndex);
+            const response = await adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
 
             if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.ROUTING_TABLE_RESPONSE>(response)) {
                 throw new Zdo.StatusError(response[0]);
@@ -1238,11 +1278,15 @@ export class Device extends Entity<ControllerEventMap> {
     }
 
     public async bindingTable(): Promise<BindingTableEntry[]> {
+        const adapter = Entity.getAdapterByID(this.databaseID);
+        if (!adapter) {
+            throw new Error(`No adapter found for database ID ${this.databaseID}`);
+        }
         const clusterId = Zdo.ClusterId.BINDING_TABLE_REQUEST;
         const table: BindingTableEntry[] = [];
         const request = async (startIndex: number): Promise<[tableEntries: number, entryCount: number]> => {
-            const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, startIndex);
-            const response = await Entity.adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+            const zdoPayload = Zdo.Buffalo.buildRequest(adapter.hasZdoMessageOverhead, clusterId, startIndex);
+            const response = await adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
 
             if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.BINDING_TABLE_RESPONSE>(response)) {
                 throw new Zdo.StatusError(response[0]);
@@ -1297,9 +1341,13 @@ export class Device extends Entity<ControllerEventMap> {
      * @param eui64List list of bind entries to match and clear. Send `["0xffffffffffffffff"]` to clear all.
      */
     public async clearAllBindings(eui64List: Eui64[]): Promise<void> {
+        const adapter = Entity.getAdapterByID(this.databaseID);
+        if (!adapter) {
+            throw new Error(`No adapter found for database ID ${this.databaseID}`);
+        }
         const clusterId = Zdo.ClusterId.CLEAR_ALL_BINDINGS_REQUEST;
-        const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, {eui64List});
-        const response = await Entity.adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+        const zdoPayload = Zdo.Buffalo.buildRequest(adapter.hasZdoMessageOverhead, clusterId, {eui64List});
+        const response = await adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
 
         if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.CLEAR_ALL_BINDINGS_RESPONSE>(response)) {
             throw new Zdo.StatusError(response[0]);
@@ -1350,7 +1398,11 @@ export class Device extends Entity<ControllerEventMap> {
         transactionSequenceNumber: number | undefined,
         timeout: number,
     ): {promise: Promise<TZclFrame<"genOta", Co>>; cancel: () => void} {
-        const waiter = Entity.adapter.waitFor(
+        const adapter = Entity.getAdapterByID(this.databaseID);
+        if (!adapter) {
+            throw new Error(`No adapter found for database ID ${this.databaseID}`);
+        }
+        const waiter = adapter.waitFor(
             this.networkAddress,
             endpointId,
             Zcl.FrameType.SPECIFIC,
@@ -1451,7 +1503,7 @@ export class Device extends Entity<ControllerEventMap> {
             const scenesEndpoint = this.endpoints.find((e) => e.supportsOutputCluster("genScenes"));
 
             if (scenesEndpoint !== undefined) {
-                await scenesEndpoint.write("genScenes", {currentGroup: 49502});
+                await scenesEndpoint.write("genScenes", {currentGroup: 49502}, {disableDefaultResponse: true, sendPolicy: "immediate"});
             }
         }
 

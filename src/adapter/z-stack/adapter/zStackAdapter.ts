@@ -22,6 +22,7 @@ import {isMtCmdAreqZdo} from "../znp/utils";
 import {Endpoints} from "./endpoints";
 import {ZnpAdapterManager} from "./manager";
 import {ZnpVersion} from "./tstype";
+import {KonnextConfig} from "../../../controller/model/konnextConfig";
 
 const NS = "zh:zstack";
 const Subsystem = UnpiConstants.Subsystem;
@@ -72,14 +73,16 @@ export class ZStackAdapter extends Adapter {
     private interpanLock: boolean;
     private interpanEndpointRegistered: boolean;
     private waitress: Waitress<Events.ZclPayload, WaitressMatcher>;
+    private konnextConfig: KonnextConfig;
 
-    public constructor(networkOptions: NetworkOptions, serialPortOptions: SerialPortOptions, backupPath: string, adapterOptions: AdapterOptions) {
+    public constructor(networkOptions: NetworkOptions, serialPortOptions: SerialPortOptions, backupPath: string, adapterOptions: AdapterOptions, konnextConfig: KonnextConfig) {
         super(networkOptions, serialPortOptions, backupPath, adapterOptions);
         this.hasZdoMessageOverhead = false;
         this.manufacturerID = Zcl.ManufacturerCode.TEXAS_INSTRUMENTS;
         // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-        this.znp = new Znp(this.serialPortOptions.path!, this.serialPortOptions.baudRate!, this.serialPortOptions.rtscts!);
+        this.znp = new Znp(this.serialPortOptions.path!, this.serialPortOptions.baudRate!, this.serialPortOptions.rtscts!, konnextConfig);
 
+        this.konnextConfig = konnextConfig;
         this.transactionID = 0;
         this.deviceAnnounceRouteDiscoveryDebouncers = new Map();
         this.interpanLock = false;
