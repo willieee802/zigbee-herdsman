@@ -1,5 +1,10 @@
 lockfileVersion: '6.0'
 
+onlyBuiltDependencies:
+  - '@biomejs/biome'
+  - '@serialport/bindings-cpp'
+  - esbuild
+
 dependencies:
   '@serialport/bindings-cpp':
     specifier: ^12.0.1
@@ -46,8 +51,8 @@ devDependencies:
     specifier: '*'
     version: 7.0.0-beta.4(@babel/core@6.0.0-bridge.1)
   '@biomejs/biome':
-    specifier: ^2.4.4
-    version: 2.4.4
+    specifier: ^2.4.5
+    version: 2.4.5
   '@date-fns/tz':
     specifier: ^1.4.1
     version: 1.4.1
@@ -70,8 +75,8 @@ devDependencies:
     specifier: '*'
     version: 0.0.14-alpha
   '@types/node':
-    specifier: ^24.10.13
-    version: 24.10.13
+    specifier: ^24.11.0
+    version: 24.11.0
   '@typescript-eslint/eslint-plugin':
     specifier: '*'
     version: 0.0.1-alpha.0(eslint@0.0.4)(typescript@5.9.2)
@@ -110,7 +115,7 @@ devDependencies:
     version: 5.9.2
   vitest:
     specifier: ^3.2.4
-    version: 3.2.4(@types/debug@0.0.15-alpha)(@types/node@24.10.13)
+    version: 3.2.4(@types/debug@0.0.15-alpha)(@types/node@24.11.0)
   zigbee-on-host:
     specifier: ^0.2.4
     version: 0.2.4
@@ -754,94 +759,86 @@ packages:
     engines: {node: '>=18'}
     dev: true
 
-  /@biomejs/biome@2.4.4:
-    resolution: {integrity: sha512-tigwWS5KfJf0cABVd52NVaXyAVv4qpUXOWJ1rxFL8xF1RVoeS2q/LK+FHgYoKMclJCuRoCWAPy1IXaN9/mS61Q==}
+  /@biomejs/biome@2.4.5:
+    resolution: {integrity: sha512-OWNCyMS0Q011R6YifXNOg6qsOg64IVc7XX6SqGsrGszPbkVCoaO7Sr/lISFnXZ9hjQhDewwZ40789QmrG0GYgQ==}
     engines: {node: '>=14.21.3'}
     hasBin: true
     optionalDependencies:
-      '@biomejs/cli-darwin-arm64': 2.4.4
-      '@biomejs/cli-darwin-x64': 2.4.4
-      '@biomejs/cli-linux-arm64': 2.4.4
-      '@biomejs/cli-linux-arm64-musl': 2.4.4
-      '@biomejs/cli-linux-x64': 2.4.4
-      '@biomejs/cli-linux-x64-musl': 2.4.4
-      '@biomejs/cli-win32-arm64': 2.4.4
-      '@biomejs/cli-win32-x64': 2.4.4
+      '@biomejs/cli-darwin-arm64': 2.4.5
+      '@biomejs/cli-darwin-x64': 2.4.5
+      '@biomejs/cli-linux-arm64': 2.4.5
+      '@biomejs/cli-linux-arm64-musl': 2.4.5
+      '@biomejs/cli-linux-x64': 2.4.5
+      '@biomejs/cli-linux-x64-musl': 2.4.5
+      '@biomejs/cli-win32-arm64': 2.4.5
+      '@biomejs/cli-win32-x64': 2.4.5
     dev: true
 
-  /@biomejs/cli-darwin-arm64@2.4.4:
-    resolution: {integrity: sha512-jZ+Xc6qvD6tTH5jM6eKX44dcbyNqJHssfl2nnwT6vma6B1sj7ZLTGIk6N5QwVBs5xGN52r3trk5fgd3sQ9We9A==}
+  /@biomejs/cli-darwin-arm64@2.4.5:
+    resolution: {integrity: sha512-lGS4Nd5O3KQJ6TeWv10mElnx1phERhBxqGP/IKq0SvZl78kcWDFMaTtVK+w3v3lusRFxJY78n07PbKplirsU5g==}
     engines: {node: '>=14.21.3'}
     cpu: [arm64]
     os: [darwin]
-    requiresBuild: true
     dev: true
     optional: true
 
-  /@biomejs/cli-darwin-x64@2.4.4:
-    resolution: {integrity: sha512-Dh1a/+W+SUCXhEdL7TiX3ArPTFCQKJTI1mGncZNWfO+6suk+gYA4lNyJcBB+pwvF49uw0pEbUS49BgYOY4hzUg==}
+  /@biomejs/cli-darwin-x64@2.4.5:
+    resolution: {integrity: sha512-6MoH4tyISIBNkZ2Q5T1R7dLd5BsITb2yhhhrU9jHZxnNSNMWl+s2Mxu7NBF8Y3a7JJcqq9nsk8i637z4gqkJxQ==}
     engines: {node: '>=14.21.3'}
     cpu: [x64]
     os: [darwin]
-    requiresBuild: true
     dev: true
     optional: true
 
-  /@biomejs/cli-linux-arm64-musl@2.4.4:
-    resolution: {integrity: sha512-+sPAXq3bxmFwhVFJnSwkSF5Rw2ZAJMH3MF6C9IveAEOdSpgajPhoQhbbAK12SehN9j2QrHpk4J/cHsa/HqWaYQ==}
+  /@biomejs/cli-linux-arm64-musl@2.4.5:
+    resolution: {integrity: sha512-iqLDgpzobG7gpBF0fwEVS/LT8kmN7+S0E2YKFDtqliJfzNLnAiV2Nnyb+ehCDCJgAZBASkYHR2o60VQWikpqIg==}
     engines: {node: '>=14.21.3'}
     cpu: [arm64]
     os: [linux]
     libc: [musl]
-    requiresBuild: true
     dev: true
     optional: true
 
-  /@biomejs/cli-linux-arm64@2.4.4:
-    resolution: {integrity: sha512-V/NFfbWhsUU6w+m5WYbBenlEAz8eYnSqRMDMAW3K+3v0tYVkNyZn8VU0XPxk/lOqNXLSCCrV7FmV/u3SjCBShg==}
+  /@biomejs/cli-linux-arm64@2.4.5:
+    resolution: {integrity: sha512-U1GAG6FTjhAO04MyH4xn23wRNBkT6H7NentHh+8UxD6ShXKBm5SY4RedKJzkUThANxb9rUKIPc7B8ew9Xo/cWg==}
     engines: {node: '>=14.21.3'}
     cpu: [arm64]
     os: [linux]
     libc: [glibc]
-    requiresBuild: true
     dev: true
     optional: true
 
-  /@biomejs/cli-linux-x64-musl@2.4.4:
-    resolution: {integrity: sha512-gGvFTGpOIQDb5CQ2VC0n9Z2UEqlP46c4aNgHmAMytYieTGEcfqhfCFnhs6xjt0S3igE6q5GLuIXtdQt3Izok+g==}
+  /@biomejs/cli-linux-x64-musl@2.4.5:
+    resolution: {integrity: sha512-NlKa7GpbQmNhZf9kakQeddqZyT7itN7jjWdakELeXyTU3pg/83fTysRRDPJD0akTfKDl6vZYNT9Zqn4MYZVBOA==}
     engines: {node: '>=14.21.3'}
     cpu: [x64]
     os: [linux]
     libc: [musl]
-    requiresBuild: true
     dev: true
     optional: true
 
-  /@biomejs/cli-linux-x64@2.4.4:
-    resolution: {integrity: sha512-R4+ZCDtG9kHArasyBO+UBD6jr/FcFCTH8QkNTOCu0pRJzCWyWC4EtZa2AmUZB5h3e0jD7bRV2KvrENcf8rndBg==}
+  /@biomejs/cli-linux-x64@2.4.5:
+    resolution: {integrity: sha512-NdODlSugMzTlENPTa4z0xB82dTUlCpsrOxc43///aNkTLblIYH4XpYflBbf5ySlQuP8AA4AZd1qXhV07IdrHdQ==}
     engines: {node: '>=14.21.3'}
     cpu: [x64]
     os: [linux]
     libc: [glibc]
-    requiresBuild: true
     dev: true
     optional: true
 
-  /@biomejs/cli-win32-arm64@2.4.4:
-    resolution: {integrity: sha512-trzCqM7x+Gn832zZHgr28JoYagQNX4CZkUZhMUac2YxvvyDRLJDrb5m9IA7CaZLlX6lTQmADVfLEKP1et1Ma4Q==}
+  /@biomejs/cli-win32-arm64@2.4.5:
+    resolution: {integrity: sha512-EBfrTqRIWOFSd7CQb/0ttjHMR88zm3hGravnDwUA9wHAaCAYsULKDebWcN5RmrEo1KBtl/gDVJMrFjNR0pdGUw==}
     engines: {node: '>=14.21.3'}
     cpu: [arm64]
     os: [win32]
-    requiresBuild: true
     dev: true
     optional: true
 
-  /@biomejs/cli-win32-x64@2.4.4:
-    resolution: {integrity: sha512-gnOHKVPFAAPrpoPt2t+Q6FZ7RPry/FDV3GcpU53P3PtLNnQjBmKyN2Vh/JtqXet+H4pme8CC76rScwdjDcT1/A==}
+  /@biomejs/cli-win32-x64@2.4.5:
+    resolution: {integrity: sha512-Pmhv9zT95YzECfjEHNl3mN9Vhusw9VA5KHY0ZvlGsxsjwS5cb7vpRnHzJIv0vG7jB0JI7xEaMH9ddfZm/RozBw==}
     engines: {node: '>=14.21.3'}
     cpu: [x64]
     os: [win32]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -854,7 +851,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [ppc64]
     os: [aix]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -863,7 +859,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [arm64]
     os: [android]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -872,7 +867,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [arm]
     os: [android]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -881,7 +875,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [android]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -890,7 +883,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [arm64]
     os: [darwin]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -899,7 +891,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [darwin]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -908,7 +899,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [arm64]
     os: [freebsd]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -917,7 +907,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [freebsd]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -926,7 +915,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [arm64]
     os: [linux]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -935,7 +923,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [arm]
     os: [linux]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -944,7 +931,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [ia32]
     os: [linux]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -953,7 +939,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [loong64]
     os: [linux]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -962,7 +947,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [mips64el]
     os: [linux]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -971,7 +955,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [ppc64]
     os: [linux]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -980,7 +963,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [riscv64]
     os: [linux]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -989,7 +971,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [s390x]
     os: [linux]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -998,7 +979,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [linux]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1007,7 +987,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [arm64]
     os: [netbsd]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1016,7 +995,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [netbsd]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1025,7 +1003,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [arm64]
     os: [openbsd]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1034,7 +1011,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [openbsd]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1043,7 +1019,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [arm64]
     os: [openharmony]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1052,7 +1027,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [sunos]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1061,7 +1035,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [arm64]
     os: [win32]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1070,7 +1043,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [ia32]
     os: [win32]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1079,7 +1051,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1136,7 +1107,6 @@ packages:
   /@pkgjs/parseargs@0.11.0:
     resolution: {integrity: sha512-+1VkjdD0QBLPodGrJUeqarH8VAIvQODIbwh9XpP5Syisf7YoQgsJKPNFoqqLQlu+VQ/tVSshMR6loPMn8U+dPg==}
     engines: {node: '>=14'}
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1144,7 +1114,6 @@ packages:
     resolution: {integrity: sha512-upnNBkA6ZH2VKGcBj9Fyl9IGNPULcjXRlg0LLeaioQWueH30p6IXtJEbKAgvyv+mJaMxSm1l6xwDXYjpEMiLMg==}
     cpu: [arm]
     os: [android]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1152,7 +1121,6 @@ packages:
     resolution: {integrity: sha512-hZ+Zxj3SySm4A/DylsDKZAeVg0mvi++0PYVceVyX7hemkw7OreKdCvW2oQ3T1FMZvCaQXqOTHb8qmBShoqk69Q==}
     cpu: [arm64]
     os: [android]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1160,7 +1128,6 @@ packages:
     resolution: {integrity: sha512-W2Psnbh1J8ZJw0xKAd8zdNgF9HRLkdWwwdWqubSVk0pUuQkoHnv7rx4GiF9rT4t5DIZGAsConRE3AxCdJ4m8rg==}
     cpu: [arm64]
     os: [darwin]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1168,7 +1135,6 @@ packages:
     resolution: {integrity: sha512-ZW2KkwlS4lwTv7ZVsYDiARfFCnSGhzYPdiOU4IM2fDbL+QGlyAbjgSFuqNRbSthybLbIJ915UtZBtmuLrQAT/w==}
     cpu: [x64]
     os: [darwin]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1176,7 +1142,6 @@ packages:
     resolution: {integrity: sha512-EsKaJ5ytAu9jI3lonzn3BgG8iRBjV4LxZexygcQbpiU0wU0ATxhNVEpXKfUa0pS05gTcSDMKpn3Sx+QB9RlTTA==}
     cpu: [arm64]
     os: [freebsd]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1184,7 +1149,6 @@ packages:
     resolution: {integrity: sha512-d3DuZi2KzTMjImrxoHIAODUZYoUUMsuUiY4SRRcJy6NJoZ6iIqWnJu9IScV9jXysyGMVuW+KNzZvBLOcpdl3Vg==}
     cpu: [x64]
     os: [freebsd]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1193,7 +1157,6 @@ packages:
     cpu: [arm]
     os: [linux]
     libc: [glibc]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1202,7 +1165,6 @@ packages:
     cpu: [arm]
     os: [linux]
     libc: [musl]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1211,7 +1173,6 @@ packages:
     cpu: [arm64]
     os: [linux]
     libc: [glibc]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1220,7 +1181,6 @@ packages:
     cpu: [arm64]
     os: [linux]
     libc: [musl]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1229,7 +1189,6 @@ packages:
     cpu: [loong64]
     os: [linux]
     libc: [glibc]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1238,7 +1197,6 @@ packages:
     cpu: [loong64]
     os: [linux]
     libc: [musl]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1247,7 +1205,6 @@ packages:
     cpu: [ppc64]
     os: [linux]
     libc: [glibc]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1256,7 +1213,6 @@ packages:
     cpu: [ppc64]
     os: [linux]
     libc: [musl]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1265,7 +1221,6 @@ packages:
     cpu: [riscv64]
     os: [linux]
     libc: [glibc]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1274,7 +1229,6 @@ packages:
     cpu: [riscv64]
     os: [linux]
     libc: [musl]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1283,7 +1237,6 @@ packages:
     cpu: [s390x]
     os: [linux]
     libc: [glibc]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1292,7 +1245,6 @@ packages:
     cpu: [x64]
     os: [linux]
     libc: [glibc]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1301,7 +1253,6 @@ packages:
     cpu: [x64]
     os: [linux]
     libc: [musl]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1309,7 +1260,6 @@ packages:
     resolution: {integrity: sha512-M3bLRAVk6GOwFlPTIxVBSYKUaqfLrn8l0psKinkCFxl4lQvOSz8ZrKDz2gxcBwHFpci0B6rttydI4IpS4IS/jQ==}
     cpu: [x64]
     os: [openbsd]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1317,7 +1267,6 @@ packages:
     resolution: {integrity: sha512-tt9KBJqaqp5i5HUZzoafHZX8b5Q2Fe7UjYERADll83O4fGqJ49O1FsL6LpdzVFQcpwvnyd0i+K/VSwu/o/nWlA==}
     cpu: [arm64]
     os: [openharmony]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1325,7 +1274,6 @@ packages:
     resolution: {integrity: sha512-V5B6mG7OrGTwnxaNUzZTDTjDS7F75PO1ae6MJYdiMu60sq0CqN5CVeVsbhPxalupvTX8gXVSU9gq+Rx1/hvu6A==}
     cpu: [arm64]
     os: [win32]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1333,7 +1281,6 @@ packages:
     resolution: {integrity: sha512-UKFMHPuM9R0iBegwzKF4y0C4J9u8C6MEJgFuXTBerMk7EJ92GFVFYBfOZaSGLu6COf7FxpQNqhNS4c4icUPqxA==}
     cpu: [ia32]
     os: [win32]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1341,7 +1288,6 @@ packages:
     resolution: {integrity: sha512-laBkYlSS1n2L8fSo1thDNGrCTQMmxjYY5G0WFWjFFYZkKPjsMBsgJfGf4TLxXrF6RyhI60L8TMOjBMvXiTcxeA==}
     cpu: [x64]
     os: [win32]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1349,7 +1295,6 @@ packages:
     resolution: {integrity: sha512-2HRCml6OztYXyJXAvdDXPKcawukWY2GpR5/nxKp4iBgiO3wcoEGkAaqctIbZcNB6KlUQBIqt8VYkNSj2397EfA==}
     cpu: [x64]
     os: [win32]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -1438,15 +1383,15 @@ packages:
   /@types/mz@2.7.8:
     resolution: {integrity: sha512-mGLNqqwt8yu4pDw9rEphAiyWnEdok0GzOGrwi5EiTuDFxw7H3ZaEI4ASFKq4HaZtemtjQ8MkcmtWcrU4V0WkIw==}
     dependencies:
-      '@types/node': 24.10.13
+      '@types/node': 24.11.0
     dev: true
 
   /@types/nedb@0.0.14-alpha:
     resolution: {integrity: sha512-A0ZKxDs/7ZtkuHmazvy1JUqpnATTLlWmLAYyu7pE38ABUFxnJJYZY7LruCGE83Tm6AYEXd99Uf2szEGqA1bdIw==}
     dev: true
 
-  /@types/node@24.10.13:
-    resolution: {integrity: sha512-oH72nZRfDv9lADUBSo104Aq7gPHpQZc4BTx38r9xf9pg5LfP6EzSyH2n7qFmmxRQXh7YlUXODcYsg6PuTDSxGg==}
+  /@types/node@24.11.0:
+    resolution: {integrity: sha512-fPxQqz4VTgPI/IQ+lj9r0h+fDR66bzoeMGHp8ASee+32OSGIkeASsoZuJixsQoVef1QJbeubcPBxKk22QVoWdw==}
     dependencies:
       undici-types: 7.16.0
     dev: true
@@ -1509,7 +1454,7 @@ packages:
       std-env: 3.10.0
       test-exclude: 7.0.2
       tinyrainbow: 2.0.0
-      vitest: 3.2.4(@types/debug@0.0.15-alpha)(@types/node@24.10.13)
+      vitest: 3.2.4(@types/debug@0.0.15-alpha)(@types/node@24.11.0)
     transitivePeerDependencies:
       - supports-color
     dev: true
@@ -1538,7 +1483,7 @@ packages:
       '@vitest/spy': 3.2.4
       estree-walker: 3.0.3
       magic-string: 0.30.21
-      vite: 7.3.1(@types/node@24.10.13)
+      vite: 7.3.1(@types/node@24.11.0)
     dev: true
 
   /@vitest/pretty-format@3.2.4:
@@ -2185,7 +2130,6 @@ packages:
 
   /chokidar@1.7.0:
     resolution: {integrity: sha512-mk8fAWcRUOxY7btlLtitj3A45jOwSAxH4tOFOoEGbVsl6cL6pPMWUy7dwZ/canfj3QEdP6FHSnf/l1c6/WkzVg==}
-    requiresBuild: true
     dependencies:
       anymatch: 1.3.2
       async-each: 1.0.6
@@ -2335,7 +2279,6 @@ packages:
   /core-js@2.6.12:
     resolution: {integrity: sha512-Kb2wC0fvsWfQrgk8HU5lW6U/Lcs8+9aaYcy4ZFc6DDlo4nZ7n70dEgE5rtR0oG6ufKDUnrwfWL1mXR5ljDatrQ==}
     deprecated: core-js@<3.23.3 is no longer maintained and not recommended for usage due to the number of issues. Because of the V8 engine whims, feature detection in old core-js versions could cause a slowdown up to 100x even if nothing is polyfilled. Some versions have web compatibility issues. Please, upgrade your dependencies to the actual version of core-js.
-    requiresBuild: true
     dev: true
 
   /core-util-is@1.0.2:
@@ -3015,7 +2958,6 @@ packages:
     engines: {node: '>= 4.0'}
     os: [darwin]
     deprecated: Upgrade to fsevents v2 to mitigate potential security issues
-    requiresBuild: true
     dependencies:
       bindings: 1.5.0
       nan: 2.25.0
@@ -3026,7 +2968,6 @@ packages:
     resolution: {integrity: sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==}
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
-    requiresBuild: true
     dev: true
     optional: true
 
@@ -5342,7 +5283,7 @@ packages:
       extsprintf: 1.3.0
     dev: true
 
-  /vite-node@3.2.4(@types/node@24.10.13):
+  /vite-node@3.2.4(@types/node@24.11.0):
     resolution: {integrity: sha512-EbKSKh+bh1E1IFxeO0pg1n4dvoOTt0UDiXMd/qn++r98+jPO1xtJilvXldeuQ8giIB5IkpjCgMleHMNEsGH6pg==}
     engines: {node: ^18.0.0 || ^20.0.0 || >=22.0.0}
     hasBin: true
@@ -5351,7 +5292,7 @@ packages:
       debug: 4.4.3
       es-module-lexer: 1.7.0
       pathe: 2.0.3
-      vite: 7.3.1(@types/node@24.10.13)
+      vite: 7.3.1(@types/node@24.11.0)
     transitivePeerDependencies:
       - '@types/node'
       - jiti
@@ -5367,7 +5308,7 @@ packages:
       - yaml
     dev: true
 
-  /vite@7.3.1(@types/node@24.10.13):
+  /vite@7.3.1(@types/node@24.11.0):
     resolution: {integrity: sha512-w+N7Hifpc3gRjZ63vYBXA56dvvRlNWRczTdmCBBa+CotUzAPf5b7YMdMR/8CQoeYE5LX3W4wj6RYTgonm1b9DA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     hasBin: true
@@ -5407,7 +5348,7 @@ packages:
       yaml:
         optional: true
     dependencies:
-      '@types/node': 24.10.13
+      '@types/node': 24.11.0
       esbuild: 0.27.3
       fdir: 6.5.0(picomatch@4.0.3)
       picomatch: 4.0.3
@@ -5418,7 +5359,7 @@ packages:
       fsevents: 2.3.3
     dev: true
 
-  /vitest@3.2.4(@types/debug@0.0.15-alpha)(@types/node@24.10.13):
+  /vitest@3.2.4(@types/debug@0.0.15-alpha)(@types/node@24.11.0):
     resolution: {integrity: sha512-LUCP5ev3GURDysTWiP47wRRUpLKMOfPh+yKTx3kVIEiu5KOMeqzpnYNsKyOoVrULivR8tLcks4+lga33Whn90A==}
     engines: {node: ^18.0.0 || ^20.0.0 || >=22.0.0}
     hasBin: true
@@ -5448,7 +5389,7 @@ packages:
     dependencies:
       '@types/chai': 5.2.3
       '@types/debug': 0.0.15-alpha
-      '@types/node': 24.10.13
+      '@types/node': 24.11.0
       '@vitest/expect': 3.2.4
       '@vitest/mocker': 3.2.4(vite@7.3.1)
       '@vitest/pretty-format': 3.2.4
@@ -5468,8 +5409,8 @@ packages:
       tinyglobby: 0.2.15
       tinypool: 1.1.1
       tinyrainbow: 2.0.0
-      vite: 7.3.1(@types/node@24.10.13)
-      vite-node: 3.2.4(@types/node@24.10.13)
+      vite: 7.3.1(@types/node@24.11.0)
+      vite-node: 3.2.4(@types/node@24.11.0)
       why-is-node-running: 2.3.0
     transitivePeerDependencies:
       - jiti
