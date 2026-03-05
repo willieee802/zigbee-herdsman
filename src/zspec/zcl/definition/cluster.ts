@@ -2893,9 +2893,9 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
             velocityLift: {ID: 0x0014, type: DataType.UINT16, write: true, max: 0xffff, default: 0},
             accelerationTimeLift: {ID: 0x0015, type: DataType.UINT16, write: true, max: 0xffff, default: 0},
             decelerationTimeLift: {ID: 0x0016, type: DataType.UINT16, write: true, max: 0xffff, default: 0},
-            windowCoveringMode: {ID: 0x0017, type: DataType.BITMAP8, required: true, default: 4},
-            intermediateSetpointsLift: {ID: 0x0018, type: DataType.OCTET_STR, default: "1,0x0000"},
-            intermediateSetpointsTilt: {ID: 0x0019, type: DataType.OCTET_STR, default: "1,0x0000"},
+            windowCoveringMode: {ID: 0x0017, type: DataType.BITMAP8, write: true, required: true, default: 4},
+            intermediateSetpointsLift: {ID: 0x0018, type: DataType.OCTET_STR, write: true, default: "1,0x0000"},
+            intermediateSetpointsTilt: {ID: 0x0019, type: DataType.OCTET_STR, write: true, default: "1,0x0000"},
             // custom
             // XXX: doesn't exist?
             operationalStatus: {ID: 0x000a, type: DataType.BITMAP8},
@@ -3099,7 +3099,6 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
             },
             fourNoksHysteresisLow: {ID: 0x0102, type: DataType.UINT16, manufacturerCode: ManufacturerCode.ASTREL_GROUP_SRL, write: true, max: 0xffff},
             SinopeOccupancy: {ID: 0x0400, type: DataType.ENUM8, manufacturerCode: ManufacturerCode.SINOPE_TECHNOLOGIES, write: true, max: 0xff},
-            elkoLoad: {ID: 0x0401, type: DataType.UINT16, write: true, max: 0xffff},
             SinopeMainCycleOutput: {
                 ID: 0x0401,
                 type: DataType.UINT16,
@@ -3109,8 +3108,6 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
             },
             elkoDisplayText: {ID: 0x0402, type: DataType.CHAR_STR, write: true},
             SinopeBacklight: {ID: 0x0402, type: DataType.ENUM8, manufacturerCode: ManufacturerCode.SINOPE_TECHNOLOGIES, write: true, max: 0xff},
-            elkoSensor: {ID: 0x0403, type: DataType.ENUM8, write: true, max: 0xff},
-            elkoRegulatorTime: {ID: 0x0404, type: DataType.UINT8, write: true, max: 0xff},
             SinopeAuxCycleOutput: {
                 ID: 0x0404,
                 type: DataType.UINT16,
@@ -3118,20 +3115,6 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
                 write: true,
                 max: 0xffff,
             },
-            elkoRegulatorMode: {ID: 0x0405, type: DataType.BOOLEAN, write: true},
-            elkoPowerStatus: {ID: 0x0406, type: DataType.BOOLEAN, write: true},
-            elkoDateTime: {ID: 0x0407, type: DataType.OCTET_STR, write: true},
-            elkoMeanPower: {ID: 0x0408, type: DataType.UINT16, write: true, max: 0xffff},
-            elkoExternalTemp: {ID: 0x0409, type: DataType.INT16, write: true, min: -32768, max: 32767},
-            elkoNightSwitching: {ID: 0x0411, type: DataType.BOOLEAN, write: true},
-            elkoFrostGuard: {ID: 0x0412, type: DataType.BOOLEAN, write: true},
-            elkoChildLock: {ID: 0x0413, type: DataType.BOOLEAN, write: true},
-            elkoMaxFloorTemp: {ID: 0x0414, type: DataType.UINT8, write: true, max: 0xff},
-            elkoRelayState: {ID: 0x0415, type: DataType.BOOLEAN, write: true},
-            elkoVersion: {ID: 0x0416, type: DataType.OCTET_STR, write: true},
-            elkoCalibration: {ID: 0x0417, type: DataType.INT8, write: true, min: -128, max: 127},
-            elkoLastMessageId: {ID: 0x0418, type: DataType.UINT8, write: true, max: 0xff},
-            elkoLastMessageStatus: {ID: 0x0419, type: DataType.UINT8, write: true, max: 0xff},
             viessmannWindowOpenInternal: {
                 ID: 0x4000,
                 type: DataType.ENUM8,
@@ -7058,25 +7041,6 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
             },
         },
     },
-    manuSpecificClusterAduroSmart: {
-        ID: 0xfccc,
-        attributes: {},
-        commands: {
-            cmd0: {ID: 0x00, parameters: []},
-        },
-        commandsResponse: {},
-    },
-    manuSpecificOsram: {
-        ID: 0xfc0f,
-        attributes: {},
-        commands: {
-            saveStartupParams: {ID: 0x01, parameters: []},
-            resetStartupParams: {ID: 0x02, parameters: []},
-        },
-        commandsResponse: {
-            saveStartupParamsRsp: {ID: 0x00, parameters: []},
-        },
-    },
     manuSpecificPhilips: {
         ID: 0xfc00,
         manufacturerCode: ManufacturerCode.SIGNIFY_NETHERLANDS_B_V,
@@ -7164,33 +7128,6 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
             coldLoadPickupStatus: {ID: 0x0283, type: DataType.UINT8, write: true, max: 0xff},
         },
         commands: {},
-        commandsResponse: {},
-    },
-    manuSpecificLegrandDevices: {
-        ID: 0xfc01,
-        manufacturerCode: ManufacturerCode.LEGRAND_GROUP,
-        attributes: {
-            // attributes seems to vary depending on the device. Can't be static
-        },
-        commands: {},
-        commandsResponse: {},
-    },
-    manuSpecificLegrandDevices2: {
-        ID: 0xfc40,
-        manufacturerCode: ManufacturerCode.LEGRAND_GROUP,
-        attributes: {},
-        commands: {
-            command0: {ID: 0x00, parameters: [{name: "data", type: BuffaloZclDataType.BUFFER}]},
-        },
-        commandsResponse: {},
-    },
-    manuSpecificLegrandDevices3: {
-        ID: 0xfc41,
-        manufacturerCode: ManufacturerCode.LEGRAND_GROUP,
-        attributes: {},
-        commands: {
-            command0: {ID: 0x00, parameters: [{name: "data", type: BuffaloZclDataType.BUFFER}]},
-        },
         commandsResponse: {},
     },
     /**
@@ -7443,15 +7380,6 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
         },
         commandsResponse: {},
     },
-    manuSpecificCentraliteHumidity: {
-        ID: 0xfc45,
-        manufacturerCode: ManufacturerCode.CENTRALITE_SYSTEMS_INC,
-        attributes: {
-            measuredValue: {ID: 0x0000, type: DataType.UINT16, write: true, max: 0xffff},
-        },
-        commands: {},
-        commandsResponse: {},
-    },
     manuSpecificSmartThingsArrivalSensor: {
         ID: 0xfc05,
         manufacturerCode: ManufacturerCode.SMARTTHINGS_INC,
@@ -7460,88 +7388,6 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
         commandsResponse: {
             arrivalSensorNotify: {ID: 0x01, parameters: []},
         },
-    },
-    manuSpecificSamsungAccelerometer: {
-        ID: 0xfc02,
-        manufacturerCode: ManufacturerCode.SMARTTHINGS_INC,
-        attributes: {
-            motion_threshold_multiplier: {ID: 0x0000, type: DataType.UINT8, write: true, max: 0xff},
-            motion_threshold: {ID: 0x0002, type: DataType.UINT16, write: true, max: 0xffff},
-            acceleration: {ID: 0x0010, type: DataType.BITMAP8, write: true, max: 0xff},
-            x_axis: {ID: 0x0012, type: DataType.INT16, write: true, min: -32768, max: 32767},
-            y_axis: {ID: 0x0013, type: DataType.INT16, write: true, min: -32768, max: 32767},
-            z_axis: {ID: 0x0014, type: DataType.INT16, write: true, min: -32768, max: 32767},
-        },
-        commands: {},
-        commandsResponse: {},
-    },
-    tradfriButton: {
-        ID: 0xfc80,
-        manufacturerCode: ManufacturerCode.IKEA_OF_SWEDEN,
-        attributes: {},
-        commands: {
-            action1: {ID: 0x01, parameters: [{name: "data", type: DataType.UINT8, max: 0xff}]},
-            action2: {ID: 0x02, parameters: [{name: "data", type: DataType.UINT8, max: 0xff}]},
-            action3: {ID: 0x03, parameters: [{name: "data", type: DataType.UINT8, max: 0xff}]},
-            action4: {ID: 0x04, parameters: [{name: "data", type: DataType.UINT8, max: 0xff}]},
-            action6: {ID: 0x06, parameters: [{name: "data", type: DataType.UINT8, max: 0xff}]},
-        },
-        commandsResponse: {},
-    },
-    schneiderSpecificPilotMode: {
-        ID: 0xff23,
-        manufacturerCode: ManufacturerCode.SCHNEIDER_ELECTRIC,
-        attributes: {
-            pilotMode: {ID: 0x0031, type: DataType.ENUM8, write: true, max: 0xff},
-        },
-        commands: {},
-        commandsResponse: {},
-    },
-    manuSpecificSchneiderFanSwitchConfiguration: {
-        ID: 0xfc04,
-        manufacturerCode: ManufacturerCode.SCHNEIDER_ELECTRIC,
-        attributes: {
-            ledIndication: {ID: 0x0002, type: DataType.UINT8, write: true, max: 0xff},
-            ledOrientation: {ID: 0x0060, type: DataType.UINT8, write: true, max: 0xff},
-        },
-        commands: {},
-        commandsResponse: {},
-    },
-    sprutVoc: {
-        ID: 0x6601,
-        manufacturerCode: 26214,
-        attributes: {
-            voc: {ID: 0x6600, type: DataType.UINT16, write: true, max: 0xffff},
-        },
-        commands: {},
-        commandsResponse: {},
-    },
-    sprutNoise: {
-        ID: 0x6602,
-        manufacturerCode: 26214,
-        attributes: {
-            noise: {ID: 0x6600, type: DataType.SINGLE_PREC, write: true},
-            noiseDetected: {ID: 0x6601, type: DataType.BITMAP8, write: true},
-            noiseDetectLevel: {ID: 0x6602, type: DataType.SINGLE_PREC, write: true},
-            noiseAfterDetectDelay: {ID: 0x6603, type: DataType.UINT16, write: true, max: 0xffff},
-        },
-        commands: {},
-        commandsResponse: {},
-    },
-    sprutIrBlaster: {
-        ID: 0x6603,
-        manufacturerCode: 26214,
-        attributes: {},
-        commands: {
-            playStore: {ID: 0x00, parameters: [{name: "param", type: DataType.UINT8, max: 0xff}]},
-            learnStart: {ID: 0x01, parameters: [{name: "value", type: DataType.UINT8, max: 0xff}]},
-            learnStop: {ID: 0x02, parameters: [{name: "value", type: DataType.UINT8, max: 0xff}]},
-            clearStore: {ID: 0x03, parameters: []},
-            playRam: {ID: 0x04, parameters: []},
-            learnRamStart: {ID: 0x05, parameters: []},
-            learnRamStop: {ID: 0x06, parameters: []},
-        },
-        commandsResponse: {},
     },
     manuSpecificSiglisZigfred: {
         ID: 0xfc42,
@@ -7666,143 +7512,6 @@ export const Clusters: Readonly<Record<ClusterName, Readonly<ClusterDefinition>>
             },
         },
         commandsResponse: {},
-    },
-    manuSpecificAssaDoorLock: {
-        ID: 0xfc00,
-        attributes: {
-            autoLockTime: {ID: 0x0012, type: DataType.UINT8, write: true, max: 0xff},
-            wrongCodeAttempts: {ID: 0x0013, type: DataType.UINT8, write: true, max: 0xff},
-            shutdownTime: {ID: 0x0014, type: DataType.UINT8, write: true, max: 0xff},
-            batteryLevel: {ID: 0x0015, type: DataType.UINT8, write: true, max: 0xff},
-            insideEscutcheonLED: {ID: 0x0016, type: DataType.UINT8, write: true, max: 0xff},
-            volume: {ID: 0x0017, type: DataType.UINT8, write: true, max: 0xff},
-            lockMode: {ID: 0x0018, type: DataType.UINT8, write: true, max: 0xff},
-            language: {ID: 0x0019, type: DataType.UINT8, write: true, max: 0xff},
-            allCodesLockout: {ID: 0x001a, type: DataType.BOOLEAN, write: true},
-            oneTouchLocking: {ID: 0x001b, type: DataType.BOOLEAN, write: true},
-            privacyButtonSetting: {ID: 0x001c, type: DataType.BOOLEAN, write: true},
-            /* enableLogging: {ID: 0x0020, type: DataType.BOOLEAN, write: true},*/ // marked in C4 driver as not supported
-            numberLogRecordsSupported: {ID: 0x0021, type: DataType.UINT16, write: true, max: 0xffff},
-            numberPinsSupported: {ID: 0x0030, type: DataType.UINT8, write: true, max: 0xff},
-            numberScheduleSlotsPerUser: {ID: 0x0040, type: DataType.UINT8, write: true, max: 0xff},
-            alarmMask: {ID: 0x0050, type: DataType.UINT8, write: true, max: 0xff},
-        },
-        commands: {
-            getLockStatus: {ID: 0x10, response: 0, parameters: []},
-            getBatteryLevel: {ID: 0x12, parameters: []},
-            setRFLockoutTime: {ID: 0x13, parameters: []},
-            /* getLogRecord: {ID: 0x20,
-                parameters: [],
-            },*/ // marked in C4 driver as not supported
-            userCodeSet: {
-                ID: 0x30,
-                parameters: [
-                    // bit pack ("bbb", slot, status, pinLength) .. pin
-                    {name: "payload", type: DataType.CHAR_STR},
-                ],
-            },
-            userCodeGet: {
-                ID: 0x31,
-                parameters: [
-                    // bit pack ("b", slot)
-                    {name: "payload", type: DataType.CHAR_STR},
-                ],
-            },
-            userCodeClear: {
-                ID: 0x32,
-                parameters: [
-                    // bit pack ("b", slot)
-                    {name: "payload", type: DataType.CHAR_STR},
-                ],
-            },
-            clearAllUserCodes: {ID: 0x33, parameters: []},
-            setUserCodeStatus: {ID: 0x34, parameters: []},
-            getUserCodeStatus: {ID: 0x35, parameters: []},
-            getLastUserIdEntered: {ID: 0x36, parameters: []},
-            userAdded: {ID: 0x37, parameters: []},
-            userDeleted: {ID: 0x38, parameters: []},
-            setScheduleSlot: {
-                ID: 0x40,
-                parameters: [
-                    // bit pack ("bbbbbbb", 0, slot, weeklyScheduleNumber, startHour, startMinute, hours, minutes)
-                    {name: "payload", type: DataType.CHAR_STR},
-                ],
-            },
-            getScheduleSlot: {
-                ID: 0x41,
-                parameters: [
-                    // bit pack ("bb", slot, userId)
-                    {name: "payload", type: DataType.CHAR_STR},
-                ],
-            },
-            setScheduleSlotStatus: {
-                ID: 0x42,
-                parameters: [
-                    // bit pack ("bbb", 0, slot, status)
-                    {name: "payload", type: DataType.CHAR_STR},
-                ],
-            },
-            reflash: {
-                ID: 0x60,
-                response: 1,
-                parameters: [
-                    // bit pack ("bI", version, length)
-                    {name: "payload", type: DataType.CHAR_STR},
-                ],
-            },
-            reflashData: {
-                ID: 0x61,
-                response: 2,
-                parameters: [
-                    // bit pack ("IH", segmentId - 1, length) .. string sub (data, start, finish)
-                    {name: "payload", type: DataType.CHAR_STR},
-                ],
-            },
-            reflashStatus: {
-                ID: 0x62,
-                response: 3,
-                parameters: [
-                    // bit pack ("bI", reflashStatusParameter, 0x00)
-                    {name: "payload", type: DataType.CHAR_STR},
-                ],
-            },
-            getReflashLock: {ID: 0x90, parameters: []},
-            getHistory: {ID: 0xa0, parameters: []},
-            getLogin: {ID: 0xa1, parameters: []},
-            getUser: {ID: 0xa2, parameters: []},
-            getUsers: {ID: 0xa3, parameters: []},
-            getMandatoryAttributes: {ID: 0xb0, parameters: []},
-            readAttribute: {ID: 0xb1, parameters: []},
-            writeAttribute: {ID: 0xb2, parameters: []},
-            configureReporting: {ID: 0xb3, parameters: []},
-            getBasicClusterAttributes: {ID: 0xb4, parameters: []},
-        },
-        commandsResponse: {
-            getLockStatusRsp: {ID: 0x00, parameters: [{name: "status", type: DataType.UINT8, max: 0xff}]},
-            reflashRsp: {ID: 0x01, parameters: [{name: "status", type: DataType.UINT8, max: 0xff}]},
-            reflashDataRsp: {ID: 0x02, parameters: [{name: "status", type: DataType.UINT8, max: 0xff}]},
-            reflashStatusRsp: {ID: 0x03, parameters: [{name: "status", type: DataType.UINT8, max: 0xff}]},
-            /* boltStateRsp: {ID: 4,
-                parameters: [
-                    {name: 'state', type: DataType.UINT8, max: 0xff},
-                ],
-            },*/ // C4 driver has this response yet there is no command - maybe a non-specific cluster response?
-            /* lockStatusReportRsp: {ID: 5,
-                parameters: [
-                    {name: 'status', type: DataType.UINT8, max: 0xff},
-                ],
-            },*/ // C4 driver has this response yet there is no command - maybe a non-specific cluster response?
-            /* handleStateRsp: {ID: 6,
-                parameters: [
-                    {name: 'state', type: DataType.UINT8, max: 0xff},
-                ],
-            },*/ // C4 driver has this response yet there is no command - maybe a non-specific cluster response?
-            /* userStatusRsp: {ID: 7,
-                parameters: [
-                    {name: 'status', type: DataType.UINT8, max: 0xff},
-                ],
-            },*/ // C4 driver has this response yet there is no command - maybe a non-specific cluster response?
-        },
     },
     manuSpecificProfalux1: {
         ID: 0xfc21, // Config cluster, 0xfc20 mostly for commands it seems
