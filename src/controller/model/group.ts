@@ -44,7 +44,6 @@ export class Group extends ZigbeeEntity {
     // This lookup contains all groups that are queried from the database, this is to ensure that always
     // the same instance is returned.
     private static readonly groups: Map<number, Map<number, Group>> = new Map();
-    private static loadedFromDatabase = false;
 
     /** Member endpoints with valid devices (not unknown/deleted) */
     get members(): Endpoint[] {
@@ -75,7 +74,6 @@ export class Group extends ZigbeeEntity {
      */
     public static resetCache(): void {
         Group.groups.clear();
-        Group.loadedFromDatabase = false;
     }
 
     private static fromDatabaseEntry(entry: DatabaseEntry, databaseID: number): Group {
@@ -112,20 +110,16 @@ export class Group extends ZigbeeEntity {
     }
 
     private static loadFromDatabaseIfNecessary(): void {
-        if (!Group.loadedFromDatabase) {
-            Entity.databases.forEach(database => {
-                if (!Group.groups.get(database.id)) {
-                    Group.groups.set(database.id, new Map());
-                }
-                const entries = database.getEntriesIterator(['Group']);
-                for (const entry of entries) {
-                    const group = Group.fromDatabaseEntry(entry, database.id);
-                    Group.groups.get(database.id)?.set(group.groupID, group);
-                }
-            });
-
-            Group.loadedFromDatabase = true;
-        }
+        Entity.databases.forEach(database => {
+            if (!Group.groups.get(database.id)) {
+                Group.groups.set(database.id, new Map());
+            }
+            const entries = database.getEntriesIterator(['Group']);
+            for (const entry of entries) {
+                const group = Group.fromDatabaseEntry(entry, database.id);
+                Group.groups.get(database.id)?.set(group.groupID, group);
+            }
+        });
     }
 
     public static byGroupID(groupID: number, databaseID: number): Group | undefined {

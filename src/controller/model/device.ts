@@ -235,7 +235,6 @@ export class Device extends Entity<ControllerEventMap> {
     // This lookup contains all devices that are queried from the database, this is to ensure that always
     // the same instance is returned.
     private static readonly devices: Map<number, Map<string, Device>> = new Map<number, Map<string, Device>>();
-    private static loadedFromDatabase = false;
     private static readonly deletedDevices: Map<number /* databaseID */, Map<string /* IEEE */, Device>> = new Map();
     private static readonly nwkToIeeeCache: Map<number /* databaseID */, Map<number /* nwk addr */, string /* IEEE */>> = new Map();
 
@@ -501,7 +500,6 @@ export class Device extends Entity<ControllerEventMap> {
      */
     public static resetCache(): void {
         Device.devices.clear();
-        Device.loadedFromDatabase = false;
         Device.deletedDevices.clear();
         Device.nwkToIeeeCache.clear();
     }
@@ -608,23 +606,19 @@ export class Device extends Entity<ControllerEventMap> {
     }
 
     private static loadFromDatabaseIfNecessary(): void {
-        if (!Device.loadedFromDatabase) {
-            Entity.databases.forEach(database => {
-                if (!Device.devices.has(database.id)) {
-                    Device.devices.set(database.id, new Map<string, Device>());
-                    Device.deletedDevices.set(database.id, new Map<string, Device>());
-                    Device.nwkToIeeeCache.set(database.id, new Map<number, string>());
-                    const entries = database.getEntriesIterator(['Coordinator', 'EndDevice', 'Router', 'GreenPower', 'Unknown']);
-                    for (const entry of entries) {
-                        const device = Device.fromDatabaseEntry(entry, database.id);
-                        Device.devices.get(database.id)!.set(device.ieeeAddr, device);
-                        Device.nwkToIeeeCache.get(database.id)!.set(device.networkAddress, device.ieeeAddr);
-                    }
+        Entity.databases.forEach(database => {
+            if (!Device.devices.has(database.id)) {
+                Device.devices.set(database.id, new Map<string, Device>());
+                Device.deletedDevices.set(database.id, new Map<string, Device>());
+                Device.nwkToIeeeCache.set(database.id, new Map<number, string>());
+                const entries = database.getEntriesIterator(['Coordinator', 'EndDevice', 'Router', 'GreenPower', 'Unknown']);
+                for (const entry of entries) {
+                    const device = Device.fromDatabaseEntry(entry, database.id);
+                    Device.devices.get(database.id)!.set(device.ieeeAddr, device);
+                    Device.nwkToIeeeCache.get(database.id)!.set(device.networkAddress, device.ieeeAddr);
                 }
-            });
-
-            Device.loadedFromDatabase = true;
-        }
+            }
+        });
     }
 
     public static find(databaseID: number, ieeeOrNwkAddress: string | number, includeDeleted = false): Device | undefined {
