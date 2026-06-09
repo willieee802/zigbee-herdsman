@@ -1,9 +1,9 @@
 /* v8 ignore start */
 
 import equals from "fast-deep-equal/es6";
-
 import {TOUCHLINK_PROFILE_ID} from "../../../zspec/consts";
 import type {Eui64, NodeId} from "../../../zspec/tstypes";
+import {FrameType} from "../../../zspec/zcl";
 import type {ZclPayload} from "../../events";
 import type {EmberApsFrame} from "../types";
 
@@ -29,6 +29,8 @@ type OneWaitressMatcher = {
     zclSequence?: number;
     /** Expected command ID for ZCL commands */
     commandIdentifier?: number;
+    /** Expected default response command ID for ZCL commands */
+    defaultRspCommandId?: number;
 };
 
 type OneWaitressEventMatcher = {
@@ -154,13 +156,21 @@ export class EmberOneWaitress {
                 continue;
             }
 
+            const {matcher} = waiter;
+            const {address, endpoint, clusterID, header} = payload;
+
             // no target in touchlink, also no APS sequence, but use the ZCL one instead
             if (
-                (waiter.matcher.apsFrame.profileId === TOUCHLINK_PROFILE_ID ||
-                    (payload.address === waiter.matcher.target && payload.endpoint === waiter.matcher.apsFrame.destinationEndpoint)) &&
-                (waiter.matcher.zclSequence === undefined || payload.header.transactionSequenceNumber === waiter.matcher.zclSequence) &&
-                (waiter.matcher.commandIdentifier === undefined || payload.header.commandIdentifier === waiter.matcher.commandIdentifier) &&
-                payload.clusterID === waiter.matcher.apsFrame.clusterId
+                (matcher.apsFrame.profileId === TOUCHLINK_PROFILE_ID ||
+                    (address === matcher.target && endpoint === matcher.apsFrame.destinationEndpoint)) &&
+                clusterID === matcher.apsFrame.clusterId &&
+                (matcher.zclSequence === undefined || header.transactionSequenceNumber === matcher.zclSequence) &&
+                (matcher.commandIdentifier === undefined ||
+                    header.commandIdentifier === matcher.commandIdentifier ||
+                    // defaultRsp
+                    (header.frameControl.frameType === FrameType.GLOBAL &&
+                        header.commandIdentifier === 0x0b &&
+                        (matcher.defaultRspCommandId === undefined || payload.data[payload.data.byteLength - 2] === matcher.defaultRspCommandId)))
             ) {
                 clearTimeout(waiter.timer);
 

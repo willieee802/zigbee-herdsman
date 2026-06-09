@@ -922,6 +922,10 @@ const commissioned3x0AlignedRequestMock = empty3x0AlignedRequestMock
     )
     .nvExtended(NvSystemIds.ZSTACK, NvItemsIds.ZCD_NV_EX_ADDRMGR, 0, Buffer.from("01ff4f3a0800000000000000", "hex"));
 
+const commissioned3x0AlignedPrecfgKeyMismatchRequestMock = commissioned3x0AlignedRequestMock
+    .clone()
+    .nv(NvItemsIds.PRECFGKEY, Buffer.from("aabbccddeeff00112233445566778899", "hex"));
+
 const empty12UnalignedRequestMock = baseZnpRequestMock
     .clone()
     .handle(Subsystem.SYS, "version", (payload) => (equals(payload, {}) ? {payload: {product: ZnpVersion.ZStack12}} : undefined))
@@ -1971,6 +1975,18 @@ describe("zstack-adapter", () => {
         expect(mockLogger.warning.mock.calls[0][0]).toBe("Extended PAN ID is reversed (expected=00124b0009d69f77, actual=779fd609004b1200)");
     });
 
+    it("should start with 3.x.0 adapter - warn when preconfigured key doesn't match network key", async () => {
+        // https://github.com/Koenkk/zigbee-herdsman/pull/1692
+        mockZnpRequestWith(commissioned3x0AlignedPrecfgKeyMismatchRequestMock);
+        const result = await adapter.start();
+        expect(result).toBe("resumed");
+        expect(mockLogger.warning.mock.calls[0][0]).toBe(
+            "Adapter preconfigured (transport) key does not match configured network key " +
+                "(preconfigured=aabbccddeeff00112233445566778899, configured=01030507090b0d0f00020406080a0c0d). " +
+                "This is typically harmless on Z-Stack 3.x adapters where only the active key matters.",
+        );
+    });
+
     it("should restore unified backup with 3.0.x adapter - commissioned, mismatched adapter-config, matching config-backup", async () => {
         const backupFile = getTempFile();
         fs.writeFileSync(backupFile, JSON.stringify(backupMatchingConfig), "utf8");
@@ -2301,6 +2317,34 @@ describe("zstack-adapter", () => {
             4,
             "dataRequest",
             {clusterid: 0, data: frame.toBuffer(), destendpoint: 20, dstaddr: 2, len: 6, options: 0, radius: 30, srcendpoint: 1, transid: 1},
+            99,
+        );
+    });
+
+    it("Send zcl frame with APS encryption", async () => {
+        basicMocks();
+        await adapter.start();
+
+        mockZnpRequest.mockClear();
+        mockQueueExecute.mockClear();
+        const frame = Zcl.Frame.create(
+            Zcl.FrameType.GLOBAL,
+            Zcl.Direction.CLIENT_TO_SERVER,
+            true,
+            undefined,
+            3,
+            "read",
+            "zigbeeDirectConfiguration",
+            [{attrId: 0}],
+            {},
+        );
+        await adapter.sendZclFrameToEndpoint("0x1122334455667788", 1234, 232, frame, 10000, true, false);
+        expect(mockQueueExecute.mock.calls[0][1]).toBe(1234);
+        expect(mockZnpRequest).toHaveBeenCalledTimes(1);
+        expect(mockZnpRequest).toHaveBeenCalledWith(
+            4,
+            "dataRequest",
+            {clusterid: 61, data: frame.toBuffer(), destendpoint: 232, dstaddr: 1234, len: 5, options: 64, radius: 30, srcendpoint: 1, transid: 1},
             99,
         );
     });
@@ -3062,7 +3106,7 @@ describe("zstack-adapter", () => {
         expect(error.message).toStrictEqual("Data request failed with error: 'APS_DUPLICATE_ENTRY' (0xb8)");
     });
 
-    it("Send zcl frame network address and default response", async () => {
+    it("Send zcl frame network address matches by tsn", async () => {
         basicMocks();
         await adapter.start();
 
@@ -3129,7 +3173,7 @@ describe("zstack-adapter", () => {
         expect(result.data).toStrictEqual(Buffer.from([24, 100, 1, 0, 0, 0, 32, 2]));
     });
 
-    it("Send zcl frame network address and default response", async () => {
+    it("Send zcl frame network address matches on default response", async () => {
         basicMocks();
         await adapter.start();
 
@@ -3147,26 +3191,18 @@ describe("zstack-adapter", () => {
             [{attrId: 0, attrData: 5, dataType: 32, status: 0}],
             {},
         );
-        const responseFrame = Zcl.Frame.create(
+        const defaultResponse = Zcl.Frame.create(
             Zcl.FrameType.GLOBAL,
             Zcl.Direction.SERVER_TO_CLIENT,
             true,
             undefined,
             100,
-            "readRsp",
+            "defaultRsp",
             0,
-            [{attrId: 0, attrData: 2, dataType: 32, status: 0}],
+            {cmdId: 0, statusCode: Zcl.Status.NOT_AUTHORIZED},
             {},
         );
         const frame = Zcl.Frame.create(Zcl.FrameType.GLOBAL, Zcl.Direction.CLIENT_TO_SERVER, false, undefined, 100, "read", 0, [{attrId: 0}], {});
-        const object = mockZpiObject(Type.AREQ, Subsystem.AF, "incomingMsg", {
-            clusterid: 0,
-            srcendpoint: 20,
-            srcaddr: 2,
-            linkquality: 101,
-            groupid: 12,
-            data: responseFrame.toBuffer(),
-        });
         const objectMismatch = mockZpiObject(Type.AREQ, Subsystem.AF, "incomingMsg", {
             clusterid: 0,
             srcendpoint: 20,
@@ -3175,29 +3211,17 @@ describe("zstack-adapter", () => {
             groupid: 12,
             data: responseMismatchFrame.toBuffer(),
         });
-        const defaultReponse = Zcl.Frame.create(
-            Zcl.FrameType.GLOBAL,
-            Zcl.Direction.SERVER_TO_CLIENT,
-            true,
-            undefined,
-            100,
-            "defaultRsp",
-            0,
-            {cmdId: 0, status: 0},
-            {},
-        );
         const defaultObject = mockZpiObject(Type.AREQ, Subsystem.AF, "incomingMsg", {
             clusterid: 0,
             srcendpoint: 20,
             srcaddr: 2,
             linkquality: 101,
             groupid: 12,
-            data: defaultReponse.toBuffer(),
+            data: defaultResponse.toBuffer(),
         });
         const response = adapter.sendZclFrameToEndpoint("0x02", 2, 20, frame, 10000, false, false);
         znpReceived(objectMismatch);
         znpReceived(defaultObject);
-        znpReceived(object);
         const result = await response;
 
         expect(mockZnpRequest).toHaveBeenCalledWith(
@@ -3213,7 +3237,7 @@ describe("zstack-adapter", () => {
         expect(result.linkquality).toStrictEqual(101);
         expect(result.address).toStrictEqual(2);
         expect(result.groupID).toStrictEqual(12);
-        expect(result.data).toStrictEqual(Buffer.from([24, 100, 1, 0, 0, 0, 32, 2]));
+        expect(result.data).toStrictEqual(Buffer.from([24, 100, 11, 0, 126]));
     });
 
     it("Send zcl frame network address data confirm fails with default response", async () => {
@@ -3300,7 +3324,7 @@ describe("zstack-adapter", () => {
             {clusterid: 0, data: frame.toBuffer(), destendpoint: 20, dstaddr: 2, len: 5, options: 0, radius: 30, srcendpoint: 1, transid: 2},
             99,
         );
-        expect(error).toStrictEqual(new Error("Timeout - 2 - 20 - 100 - 0 - 1 after 1ms"));
+        expect(error).toStrictEqual(new Error("Timeout after 1ms [address=2 endpoint=20 clusterId=0 cmdId=1 tsn=100]"));
     });
 
     it("Send zcl frame network address timeout should discover route, rewrite child entry and retry for sleepy end device", async () => {
@@ -3361,7 +3385,7 @@ describe("zstack-adapter", () => {
             {clusterid: 0, data: frame.toBuffer(), destendpoint: 20, dstaddr: 2, len: 5, options: 0, radius: 30, srcendpoint: 1, transid: 2},
             99,
         );
-        expect(error).toStrictEqual(new Error("Timeout - 2 - 20 - 100 - 0 - 1 after 1ms"));
+        expect(error).toStrictEqual(new Error("Timeout after 1ms [address=2 endpoint=20 clusterId=0 cmdId=1 tsn=100]"));
     });
 
     it("Send zcl frame network address with default response timeout shouldnt care because command has response", async () => {
@@ -3975,7 +3999,7 @@ describe("zstack-adapter", () => {
         expect(error).toStrictEqual(new Error("Failed to connect to the adapter (Error: Couldnt lock port)"));
     });
 
-    it("Wait for", async () => {
+    it("Wait for resolves on cmd", async () => {
         basicMocks();
         await adapter.start();
 
@@ -3998,15 +4022,47 @@ describe("zstack-adapter", () => {
             groupid: 12,
             data: responseFrame.toBuffer(),
         });
-        const wait = adapter.waitFor(2, 20, 0, 1, 100, 0, 1, 10);
+        const wait = adapter.waitFor(2, 20, 0, 1, 100, 0, 1, undefined, 10);
         znpReceived(object);
         const result = await wait.promise;
         expect(result.endpoint).toStrictEqual(20);
         expect(result.groupID).toStrictEqual(12);
         expect(result.linkquality).toStrictEqual(101);
         expect(result.address).toStrictEqual(2);
-        expect(result.groupID).toStrictEqual(12);
         expect(result.data).toStrictEqual(Buffer.from([24, 100, 1, 0, 0, 0, 32, 2]));
+    });
+
+    it("Wait for resolves on specified default response", async () => {
+        basicMocks();
+        await adapter.start();
+
+        const responseFrame = Zcl.Frame.create(
+            Zcl.FrameType.GLOBAL,
+            Zcl.Direction.SERVER_TO_CLIENT,
+            true,
+            undefined,
+            99,
+            "defaultRsp",
+            "genOta",
+            {cmdId: 5, statusCode: Zcl.Status.MALFORMED_COMMAND},
+            {},
+        );
+        const object = mockZpiObject(Type.AREQ, Subsystem.AF, "incomingMsg", {
+            clusterid: 0x0019,
+            srcendpoint: 1,
+            srcaddr: 1234,
+            linkquality: 101,
+            groupid: 0,
+            data: responseFrame.toBuffer(),
+        });
+        const wait = adapter.waitFor(1234, 1, Zcl.FrameType.SPECIFIC, Zcl.Direction.CLIENT_TO_SERVER, undefined, 0x0019, 3, 5, 15000);
+        znpReceived(object);
+        const result = await wait.promise;
+        expect(result.endpoint).toStrictEqual(1);
+        expect(result.groupID).toStrictEqual(0);
+        expect(result.linkquality).toStrictEqual(101);
+        expect(result.address).toStrictEqual(1234);
+        expect(result.data).toStrictEqual(Buffer.from([24, 99, 11, 5, Zcl.Status.MALFORMED_COMMAND]));
     });
 
     it("Command should fail when in interpan", async () => {

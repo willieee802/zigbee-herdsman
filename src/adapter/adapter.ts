@@ -10,6 +10,19 @@ import type * as AdapterEvents from "./events";
 import type * as TsType from "./tstype";
 import {KonnextConfig} from "../controller/model/konnextConfig";
 
+export interface ZclWaitressPayload extends AdapterEvents.ZclPayload {
+    header: NonNullable<AdapterEvents.ZclPayload["header"]>;
+}
+
+export interface ClusterWaitressMatcher {
+    address: number | string | undefined;
+    clusterId: number;
+    endpoint?: number;
+    commandId?: number;
+    defaultRspCommandId?: number;
+    transactionSequenceNumber?: number;
+}
+
 interface AdapterEventMap {
     deviceJoined: [payload: AdapterEvents.DeviceJoinedPayload];
     zclPayload: [payload: AdapterEvents.ZclPayload];
@@ -105,6 +118,27 @@ export abstract class Adapter extends events.EventEmitter<AdapterEventMap> {
         }
     }
 
+    static clusterWaitressTimeoutFormatter(matcher: ClusterWaitressMatcher, timeout: number): string {
+        return `Timeout after ${timeout}ms [address=${matcher.address} endpoint=${matcher.endpoint} clusterId=${matcher.clusterId} cmdId=${matcher.commandId} tsn=${matcher.transactionSequenceNumber}]`;
+    }
+
+    static zclWaitressValidator(payload: ZclWaitressPayload, matcher: ClusterWaitressMatcher): boolean {
+        const {header, address, clusterID, endpoint} = payload;
+
+        return (
+            // no sender in Touchlink
+            (matcher.address === undefined || address === matcher.address) &&
+            clusterID === matcher.clusterId &&
+            endpoint === matcher.endpoint &&
+            (matcher.transactionSequenceNumber === undefined || header.transactionSequenceNumber === matcher.transactionSequenceNumber) &&
+            (header.commandIdentifier === matcher.commandId ||
+                // defaultRsp
+                (header.frameControl.frameType === Zcl.FrameType.GLOBAL &&
+                    header.commandIdentifier === 0x0b &&
+                    (matcher.defaultRspCommandId === undefined || payload.data[payload.data.byteLength - 2] === matcher.defaultRspCommandId)))
+        );
+    }
+
     public abstract start(): Promise<TsType.StartResult>;
 
     public abstract stop(): Promise<void>;
@@ -124,13 +158,14 @@ export abstract class Adapter extends events.EventEmitter<AdapterEventMap> {
     public abstract addInstallCode(ieeeAddress: string, key: Buffer, hashed: boolean): Promise<void>;
 
     public abstract waitFor(
-        networkAddress: number | undefined,
+        networkAddress: number,
         endpoint: number,
         frameType: Zcl.FrameType,
         direction: Zcl.Direction,
         transactionSequenceNumber: number | undefined,
-        clusterID: number,
-        commandIdentifier: number,
+        clusterId: number,
+        commandId: number,
+        defaultRspCommandId: number | undefined,
         timeout: number,
     ): {promise: Promise<AdapterEvents.ZclPayload>; cancel: () => void};
 
