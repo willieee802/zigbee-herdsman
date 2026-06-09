@@ -11,6 +11,7 @@ import type {Eui64} from "../zspec/tstypes";
 import * as Zcl from "../zspec/zcl";
 import type {TPartialClusterAttributes} from "../zspec/zcl/definition/clusters-types";
 import type {CustomClusters, FrameControl} from "../zspec/zcl/definition/tstype";
+import {ZclStatusError} from "../zspec/zcl/zclStatusError";
 import * as Zdo from "../zspec/zdo";
 import type * as ZdoTypes from "../zspec/zdo/definition/tstypes";
 import Database from "./database";
@@ -305,7 +306,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 zcl.manufacturerCode,
                 0,
                 zcl.commandKey,
-                clusterKey ?? Zcl.Clusters.touchlink.ID,
+                clusterKey ?? "touchlink",
                 zcl.payload,
                 customClusters,
             );
@@ -735,6 +736,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         this.selfAndDeviceEmit(device, "lastSeenChanged", {device, reason: "deviceAnnounce"});
         device.implicitCheckin();
         this.checkDeviceNetworkAddress(device, payload.eui64, payload.nwkAddress);
+        device.resetTransient(false);
         this.selfAndDeviceEmit(device, "deviceAnnounce", {device});
     }
 
@@ -883,10 +885,13 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 undefined,
                 this.database.id,
             );
+
+            device.resetTransient(true);
             this.selfAndDeviceEmit(device, "deviceJoined", {device});
         } else if (device.isDeleted) {
             logger.debug(`Deleted device '${payload.ieeeAddr}' joined, undeleting`, NS);
             device.undelete();
+            device.resetTransient(true);
             this.selfAndDeviceEmit(device, "deviceJoined", {device});
         }
 
@@ -950,6 +955,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
     private async onZclPayload(payload: AdapterEvents.ZclPayload): Promise<void> {
         let frame: Zcl.Frame | undefined;
         let device: Device | undefined;
+        let defaultResponse: Zcl.Status | undefined;
 
         if (payload.clusterID === Zcl.Clusters.touchlink.ID) {
             // This is handled by touchlink
@@ -1014,6 +1020,10 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 frame = Zcl.Frame.fromBuffer(payload.clusterID, payload.header, payload.data, device ? device.customClusters : {});
             } catch (error) {
                 logger.debug(`Failed to parse frame: ${error}`, NS);
+
+                if (error instanceof ZclStatusError) {
+                    defaultResponse = error.code;
+                }
             }
         }
 
@@ -1151,7 +1161,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         }
 
         if (frame) {
-            await device.onZclData(payload, frame, endpoint);
+            await device.onZclData(payload, frame, endpoint, defaultResponse);
         }
     }
 }
